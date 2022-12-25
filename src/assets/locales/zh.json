@@ -1,0 +1,17 @@
+{
+  "index": {
+    "chart": "图表",
+    "map": "地图",
+    "address": "地址",
+    "data": "数据"
+  },
+  "chart": {
+    "name": "统计图表"
+  },
+  "data": {},
+  "common": {
+    "loading": "加载中...",
+    "date_pattern": "yyyy年mm月dd日",
+    "short_date_pattern": "mm月dd日"
+  }
+}

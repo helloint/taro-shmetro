@@ -1,0 +1,56 @@
+name: Weapp Build & Upload
+
+on:
+  #  push:
+  #    branches: [master]
+  #  pull_request:
+  #    branches: [master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 ｜ 留空会默认1.0.0'
+      desc:
+        description: '项目备注 | 留空会读取PR title或最后一次的commit message'
+      action_type:
+        description: '上传或预览'
+        options:
+          - preview
+          - upload
+        default: 'upload'
+      robots:
+        description: '选择用于上传的robot'
+        options:
+          - master=1
+          - master=3
+        default: 'master=3'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Use Node.js
+        uses: actions/setup-node@v1
+        with:
+          node-version: '12.22'
+
+      - name: Install Dependencies
+        run: npm i
+
+      - name: Build weapp
+        run: npm run build:weapp
+
+      - name: actions.mini-program
+        uses: echoings/actions.mini-program@main
+        with:
+          project_type: miniProgram
+          action_type: ${{ github.event.inputs.action_type }}
+          project_path: ./dist
+          version: ${{ github.event.inputs.version }}
+          remark: ${{ github.event.inputs.desc }}
+          robots: ${{ github.event.inputs.robots }}
+          command_options: --enable-es6
+            --project-ignores=['node_modules/**/*']
+        env:
+          MINI_APP_ID: ${{ secrets.APP_ID }}
+          MINI_APP_PRIVATE_KEY: ${{ secrets.UPLOAD_PRIVATE_KEY }}
