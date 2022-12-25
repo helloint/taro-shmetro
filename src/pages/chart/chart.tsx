@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import Echarts, { EChartOption, EChartsInstance } from 'taro-react-echarts';
 import echarts from '../../assets/js/echarts';
 import { getDailyTotal } from '../../store/dailyTotal/dailyTotalSlice';
@@ -10,19 +11,19 @@ interface Props {
   styleRatio: number;
 }
 
-const getOption: EChartOption = (styleZoom, styleRatio) => {
-  return {
+const getOption: EChartOption = (styleZoom, styleRatio, t) => {
+  const option = {
     title: {
       top: 10 * styleZoom * styleRatio,
       itemGap: 10 * styleZoom,
       left: 'center',
-      text: '上海地铁客流统计',
+      text: t('chart.name'),
       textStyle: {
-        fontSize: 18 * styleZoom,
+        fontSize: 20 * styleZoom,
       },
-      subtext: '数据来源于微博@上海地铁shmetro',
+      subtext: t('chart.subtitle'),
       subtextStyle: {
-        fontSize: 12 * styleZoom,
+        fontSize: 14 * styleZoom,
       },
       sublink: 'https://weibo.com/u/1742987497',
     },
@@ -81,32 +82,37 @@ const getOption: EChartOption = (styleZoom, styleRatio) => {
           var d = echarts.number.parseDate(params.value[0]);
           return d.getDate() + '日' + '\n\n' + params.value[1] + 'w';
         },
-        fontSize: 12 * styleZoom,
+        fontSize: 16 * styleZoom,
         color: '#fff',
       },
       data: [],
     },
-    toolbox: {
+    toolbox: {},
+  };
+  if (process.env.TARO_ENV !== 'weapp') {
+    option.toolbox = {
       feature: {
         saveAsImage: {
           type: 'png',
         },
       },
-    },
-  };
+    };
+  }
+  return option;
 };
 
 export const Chart = (props: Props) => {
+  const { t } = useTranslation();
   const { styleZoom, styleRatio } = props;
   const ref = useRef<EChartsInstance>(null);
   const [isReady, setIsReady] = useState(false);
   const { dailyTotal } = useAppSelector((state) => state.dailyTotal);
   const dispatch = useAppDispatch();
-  const option = useMemo(() => getOption(styleZoom, styleRatio), [styleZoom, styleRatio]);
+  const option = useMemo(() => getOption(styleZoom, styleRatio, t), [styleZoom, styleRatio]);
 
-  console.log(`styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
-  console.log(`width: ${750 * styleZoom}, height: ${562 * styleZoom * styleRatio}`);
-  console.log(option);
+  // console.log(`styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
+  // console.log(`width: ${750 * styleZoom}, height: ${562 * styleZoom * styleRatio}`);
+  // console.log(option);
 
   useEffect(() => {
     const promise = dispatch(getDailyTotal());
@@ -131,7 +137,7 @@ export const Chart = (props: Props) => {
   }, [isReady, dailyTotal, styleZoom, styleRatio]);
 
   useEffect(() => {
-    console.log(`### Changed: styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
+    // console.log(`### Changed: styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
   }, [styleZoom, styleRatio]);
 
   return dailyTotal ? (

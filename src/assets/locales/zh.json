@@ -6,7 +6,8 @@
     "data": "数据"
   },
   "chart": {
-    "name": "统计图表"
+    "name": "上海地铁客流统计",
+    "subtitle": "数据来源于微博@上海地铁shmetro"
   },
   "data": {},
   "common": {
