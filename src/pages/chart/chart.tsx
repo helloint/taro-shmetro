@@ -134,7 +134,7 @@ export const Chart = (props: Props) => {
     console.log(`### Changed: styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
   }, [styleZoom, styleRatio]);
 
-  return (
+  return dailyTotal ? (
     <Echarts
       isPage={false}
       key='metro'
@@ -152,6 +152,8 @@ export const Chart = (props: Props) => {
         height: 562 * styleZoom * styleRatio + 'px',
       }}
     ></Echarts>
+  ) : (
+    'Loading'
   );
 };
 
