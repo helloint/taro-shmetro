@@ -124,9 +124,11 @@ export const Chart = (props: Props) => {
   useEffect(() => {
     if (isReady && dailyTotal) {
       const displayData: MetroDaily[] = [];
-      dailyTotal.forEach((item) => {
-        displayData.push(item);
-        if (displayData.length > 35) {
+      const dayOfWeek = new Date(dailyTotal[dailyTotal.length - 1][0]).getDay();
+      const totalDisplayDay = 28 + (dayOfWeek ? dayOfWeek : 7);
+      dailyTotal.forEach(([date, num]) => {
+        displayData.push([date, num]);
+        if (displayData.length > totalDisplayDay) {
           displayData.shift();
         }
       });
