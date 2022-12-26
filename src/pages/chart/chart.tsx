@@ -153,7 +153,7 @@ export const Chart = (props: Props) => {
         ref.current = echartsInstance;
         setIsReady(true);
       }}
-      opts={{ devicePixelRatio: 2, width: 750 * styleZoom, height: 562 * styleZoom * styleRatio }}
+      opts={{ width: 750 * styleZoom, height: 562 * styleZoom * styleRatio }}
       option={option}
       style={{
         width: 750 * styleZoom + 'px',
