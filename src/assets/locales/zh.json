@@ -7,7 +7,9 @@
   },
   "chart": {
     "name": "上海地铁客流统计",
-    "subtitle": "数据来源于微博@上海地铁shmetro"
+    "subtitle": "数据来源于微博@上海地铁shmetro",
+    "history": "历史数据",
+    "unit": "万人次"
   },
   "data": {},
   "common": {

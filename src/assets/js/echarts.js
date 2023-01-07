@@ -1584,6 +1584,10 @@
     e.cancelBubble = true;
   };
 
+  function isMiddleOrRightButtonOnMouseUpDown(e) {
+    return e.which === 2 || e.which === 3;
+  }
+
   var GestureMgr = function () {
     function GestureMgr() {
       this._track = [];
@@ -14542,6 +14546,25 @@
       updateElementState(child, updater, commonParam);
     });
   }
+
+  function setStatesFlag(el, stateName) {
+    switch (stateName) {
+      case 'emphasis':
+        el.hoverState = HOVER_STATE_EMPHASIS;
+        break;
+
+      case 'normal':
+        el.hoverState = HOVER_STATE_NORMAL;
+        break;
+
+      case 'blur':
+        el.hoverState = HOVER_STATE_BLUR;
+        break;
+
+      case 'select':
+        el.selected = true;
+    }
+  }
   /**
    * If we reuse elements when rerender.
    * DON'T forget to clearStates before we update the style and shape.
@@ -15092,10 +15115,29 @@
       ecData.focus = null;
     }
   }
+
+  var OTHER_STATES = ['emphasis', 'blur', 'select'];
+  var defaultStyleGetterMap = {
+    itemStyle: 'getItemStyle',
+    lineStyle: 'getLineStyle',
+    areaStyle: 'getAreaStyle'
+  };
   /**
    * Set emphasis/blur/selected states of element.
    */
 
+  function setStatesStylesFromModel(el, itemModel, styleType, // default itemStyle
+  getter) {
+    styleType = styleType || 'itemStyle';
+
+    for (var i = 0; i < OTHER_STATES.length; i++) {
+      var stateName = OTHER_STATES[i];
+      var model = itemModel.getModel([stateName, styleType]);
+      var state = el.ensureState(stateName); // Let it throw error if getterType is not found.
+
+      state.style = getter ? getter(model) : model[defaultStyleGetterMap[styleType]]();
+    }
+  }
   /**
    *
    * Set element as highlight / downplay dispatcher.
@@ -17125,6 +17167,10 @@
    * We don't need to save this because universalTransition can get old style from the old element
    */
 
+
+  function saveOldStyle(el) {
+    transitionStore(el).oldStyle = el.style;
+  }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -31074,6 +31120,14 @@
     return symbolPath;
   }
 
+  function normalizeSymbolSize(symbolSize) {
+    if (!isArray(symbolSize)) {
+      symbolSize = [+symbolSize, +symbolSize];
+    }
+
+    return [symbolSize[0] || 0, symbolSize[1] || 0];
+  }
+
   function normalizeSymbolOffset(symbolOffset, symbolSize) {
     if (symbolOffset == null) {
       return;
@@ -38228,6 +38282,16 @@
   * under the License.
   */
 
+
+  function isValueNice(val) {
+    var exp10 = Math.pow(10, quantityExponent(Math.abs(val)));
+    var f = Math.abs(val / exp10);
+    return f === 0 || f === 1 || f === 2 || f === 3 || f === 5;
+  }
+
+  function isIntervalOrLogScale(scale) {
+    return scale.type === 'interval' || scale.type === 'log';
+  }
   /**
    * @param extent Both extent[0] and extent[1] should be valid number.
    *               Should be extent[0] < extent[1].
@@ -38254,6 +38318,25 @@
     var niceTickExtent = result.niceTickExtent = [round(Math.ceil(extent[0] / interval) * interval, precision), round(Math.floor(extent[1] / interval) * interval, precision)];
     fixExtent(niceTickExtent, extent);
     return result;
+  }
+
+  function increaseInterval(interval) {
+    var exp10 = Math.pow(10, quantityExponent(interval)); // Increase interval
+
+    var f = interval / exp10;
+
+    if (!f) {
+      f = 1;
+    } else if (f === 2) {
+      f = 3;
+    } else if (f === 3) {
+      f = 5;
+    } else {
+      // f is 1 or 5
+      f *= 2;
+    }
+
+    return round(f * exp10);
   }
   /**
    * @return interval precision
@@ -38894,6 +38977,20 @@
   * under the License.
   */
 
+  /* global Float32Array */
+
+  var supportFloat32Array = typeof Float32Array !== 'undefined';
+  var Float32ArrayCtor = !supportFloat32Array ? Array : Float32Array;
+
+  function createFloat32Array(arg) {
+    if (isArray(arg)) {
+      // Return self directly if don't support TypedArray.
+      return supportFloat32Array ? new Float32Array(arg) : arg;
+    } // Else is number
+
+
+    return new Float32ArrayCtor(arg);
+  }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -38935,6 +39032,7 @@
   * specific language governing permissions and limitations
   * under the License.
   */
+
 
   var STACK_PREFIX = '__ec_stack_';
 
@@ -40498,6 +40596,13 @@
    * Check if the axis cross 0
    */
 
+
+  function ifAxisCrossZero(axis) {
+    var dataExtent = axis.scale.getExtent();
+    var min = dataExtent[0];
+    var max = dataExtent[1];
+    return !(min > 0 && max > 0 || min < 0 && max < 0);
+  }
   /**
    * @param axis
    * @return Label formatter function.
@@ -40564,6 +40669,57 @@
    * @return Be null/undefined if no labels.
    */
 
+
+  function estimateLabelUnionRect(axis) {
+    var axisModel = axis.model;
+    var scale = axis.scale;
+
+    if (!axisModel.get(['axisLabel', 'show']) || scale.isBlank()) {
+      return;
+    }
+
+    var realNumberScaleTicks;
+    var tickCount;
+    var categoryScaleExtent = scale.getExtent(); // Optimize for large category data, avoid call `getTicks()`.
+
+    if (scale instanceof OrdinalScale) {
+      tickCount = scale.count();
+    } else {
+      realNumberScaleTicks = scale.getTicks();
+      tickCount = realNumberScaleTicks.length;
+    }
+
+    var axisLabelModel = axis.getLabelModel();
+    var labelFormatter = makeLabelFormatter(axis);
+    var rect;
+    var step = 1; // Simple optimization for large amount of labels
+
+    if (tickCount > 40) {
+      step = Math.ceil(tickCount / 40);
+    }
+
+    for (var i = 0; i < tickCount; i += step) {
+      var tick = realNumberScaleTicks ? realNumberScaleTicks[i] : {
+        value: categoryScaleExtent[0] + i
+      };
+      var label = labelFormatter(tick, i);
+      var unrotatedSingleRect = axisLabelModel.getTextRect(label);
+      var singleRect = rotateTextRect(unrotatedSingleRect, axisLabelModel.get('rotate') || 0);
+      rect ? rect.union(singleRect) : rect = singleRect;
+    }
+
+    return rect;
+  }
+
+  function rotateTextRect(textRect, rotate) {
+    var rotateRadians = rotate * Math.PI / 180;
+    var beforeWidth = textRect.width;
+    var beforeHeight = textRect.height;
+    var afterWidth = beforeWidth * Math.abs(Math.cos(rotateRadians)) + Math.abs(beforeHeight * Math.sin(rotateRadians));
+    var afterHeight = beforeWidth * Math.abs(Math.sin(rotateRadians)) + Math.abs(beforeHeight * Math.cos(rotateRadians));
+    var rotatedRect = new BoundingRect(textRect.x, textRect.y, afterWidth, afterHeight);
+    return rotatedRect;
+  }
   /**
    * @param model axisLabelModel or axisTickModel
    * @return {number|String} Can be null|'auto'|number|function
@@ -45014,6 +45170,3354 @@
   * under the License.
   */
 
+  var LineSeriesModel =
+  /** @class */
+  function (_super) {
+    __extends(LineSeriesModel, _super);
+
+    function LineSeriesModel() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = LineSeriesModel.type;
+      _this.hasSymbolVisual = true;
+      return _this;
+    }
+
+    LineSeriesModel.prototype.getInitialData = function (option) {
+      {
+        var coordSys = option.coordinateSystem;
+
+        if (coordSys !== 'polar' && coordSys !== 'cartesian2d') {
+          throw new Error('Line not support coordinateSystem besides cartesian and polar');
+        }
+      }
+      return createSeriesData(null, this, {
+        useEncodeDefaulter: true
+      });
+    };
+
+    LineSeriesModel.prototype.getLegendIcon = function (opt) {
+      var group = new Group();
+      var line = createSymbol('line', 0, opt.itemHeight / 2, opt.itemWidth, 0, opt.lineStyle.stroke, false);
+      group.add(line);
+      line.setStyle(opt.lineStyle);
+      var visualType = this.getData().getVisual('symbol');
+      var visualRotate = this.getData().getVisual('symbolRotate');
+      var symbolType = visualType === 'none' ? 'circle' : visualType; // Symbol size is 80% when there is a line
+
+      var size = opt.itemHeight * 0.8;
+      var symbol = createSymbol(symbolType, (opt.itemWidth - size) / 2, (opt.itemHeight - size) / 2, size, size, opt.itemStyle.fill);
+      group.add(symbol);
+      symbol.setStyle(opt.itemStyle);
+      var symbolRotate = opt.iconRotate === 'inherit' ? visualRotate : opt.iconRotate || 0;
+      symbol.rotation = symbolRotate * Math.PI / 180;
+      symbol.setOrigin([opt.itemWidth / 2, opt.itemHeight / 2]);
+
+      if (symbolType.indexOf('empty') > -1) {
+        symbol.style.stroke = symbol.style.fill;
+        symbol.style.fill = '#fff';
+        symbol.style.lineWidth = 2;
+      }
+
+      return group;
+    };
+
+    LineSeriesModel.type = 'series.line';
+    LineSeriesModel.dependencies = ['grid', 'polar'];
+    LineSeriesModel.defaultOption = {
+      // zlevel: 0,
+      z: 3,
+      coordinateSystem: 'cartesian2d',
+      legendHoverLink: true,
+      clip: true,
+      label: {
+        position: 'top'
+      },
+      // itemStyle: {
+      // },
+      endLabel: {
+        show: false,
+        valueAnimation: true,
+        distance: 8
+      },
+      lineStyle: {
+        width: 2,
+        type: 'solid'
+      },
+      emphasis: {
+        scale: true
+      },
+      // areaStyle: {
+      // origin of areaStyle. Valid values:
+      // `'auto'/null/undefined`: from axisLine to data
+      // `'start'`: from min to data
+      // `'end'`: from data to max
+      // origin: 'auto'
+      // },
+      // false, 'start', 'end', 'middle'
+      step: false,
+      // Disabled if step is true
+      smooth: false,
+      smoothMonotone: null,
+      symbol: 'emptyCircle',
+      symbolSize: 4,
+      symbolRotate: null,
+      showSymbol: true,
+      // `false`: follow the label interval strategy.
+      // `true`: show all symbols.
+      // `'auto'`: If possible, show all symbols, otherwise
+      //           follow the label interval strategy.
+      showAllSymbol: 'auto',
+      // Whether to connect break point.
+      connectNulls: false,
+      // Sampling for large data. Can be: 'average', 'max', 'min', 'sum', 'lttb'.
+      sampling: 'none',
+      animationEasing: 'linear',
+      // Disable progressive
+      progressive: 0,
+      hoverLayerThreshold: Infinity,
+      universalTransition: {
+        divideShape: 'clone'
+      },
+      triggerLineEvent: false
+    };
+    return LineSeriesModel;
+  }(SeriesModel);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * @return label string. Not null/undefined
+   */
+
+
+  function getDefaultLabel(data, dataIndex) {
+    var labelDims = data.mapDimensionsAll('defaultedLabel');
+    var len = labelDims.length; // Simple optimization (in lots of cases, label dims length is 1)
+
+    if (len === 1) {
+      var rawVal = retrieveRawValue(data, dataIndex, labelDims[0]);
+      return rawVal != null ? rawVal + '' : null;
+    } else if (len) {
+      var vals = [];
+
+      for (var i = 0; i < labelDims.length; i++) {
+        vals.push(retrieveRawValue(data, dataIndex, labelDims[i]));
+      }
+
+      return vals.join(' ');
+    }
+  }
+
+  function getDefaultInterpolatedLabel(data, interpolatedValue) {
+    var labelDims = data.mapDimensionsAll('defaultedLabel');
+
+    if (!isArray(interpolatedValue)) {
+      return interpolatedValue + '';
+    }
+
+    var vals = [];
+
+    for (var i = 0; i < labelDims.length; i++) {
+      var dimIndex = data.getDimensionIndex(labelDims[i]);
+
+      if (dimIndex >= 0) {
+        vals.push(interpolatedValue[dimIndex]);
+      }
+    }
+
+    return vals.join(' ');
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var Symbol$1 =
+  /** @class */
+  function (_super) {
+    __extends(Symbol, _super);
+
+    function Symbol(data, idx, seriesScope, opts) {
+      var _this = _super.call(this) || this;
+
+      _this.updateData(data, idx, seriesScope, opts);
+
+      return _this;
+    }
+
+    Symbol.prototype._createSymbol = function (symbolType, data, idx, symbolSize, keepAspect) {
+      // Remove paths created before
+      this.removeAll(); // let symbolPath = createSymbol(
+      //     symbolType, -0.5, -0.5, 1, 1, color
+      // );
+      // If width/height are set too small (e.g., set to 1) on ios10
+      // and macOS Sierra, a circle stroke become a rect, no matter what
+      // the scale is set. So we set width/height as 2. See #4150.
+
+      var symbolPath = createSymbol(symbolType, -1, -1, 2, 2, null, keepAspect);
+      symbolPath.attr({
+        z2: 100,
+        culling: true,
+        scaleX: symbolSize[0] / 2,
+        scaleY: symbolSize[1] / 2
+      }); // Rewrite drift method
+
+      symbolPath.drift = driftSymbol;
+      this._symbolType = symbolType;
+      this.add(symbolPath);
+    };
+    /**
+     * Stop animation
+     * @param {boolean} toLastFrame
+     */
+
+
+    Symbol.prototype.stopSymbolAnimation = function (toLastFrame) {
+      this.childAt(0).stopAnimation(null, toLastFrame);
+    };
+
+    Symbol.prototype.getSymbolType = function () {
+      return this._symbolType;
+    };
+    /**
+     * FIXME:
+     * Caution: This method breaks the encapsulation of this module,
+     * but it indeed brings convenience. So do not use the method
+     * unless you detailedly know all the implements of `Symbol`,
+     * especially animation.
+     *
+     * Get symbol path element.
+     */
+
+
+    Symbol.prototype.getSymbolPath = function () {
+      return this.childAt(0);
+    };
+    /**
+     * Highlight symbol
+     */
+
+
+    Symbol.prototype.highlight = function () {
+      enterEmphasis(this.childAt(0));
+    };
+    /**
+     * Downplay symbol
+     */
+
+
+    Symbol.prototype.downplay = function () {
+      leaveEmphasis(this.childAt(0));
+    };
+    /**
+     * @param {number} zlevel
+     * @param {number} z
+     */
+
+
+    Symbol.prototype.setZ = function (zlevel, z) {
+      var symbolPath = this.childAt(0);
+      symbolPath.zlevel = zlevel;
+      symbolPath.z = z;
+    };
+
+    Symbol.prototype.setDraggable = function (draggable, hasCursorOption) {
+      var symbolPath = this.childAt(0);
+      symbolPath.draggable = draggable;
+      symbolPath.cursor = !hasCursorOption && draggable ? 'move' : symbolPath.cursor;
+    };
+    /**
+     * Update symbol properties
+     */
+
+
+    Symbol.prototype.updateData = function (data, idx, seriesScope, opts) {
+      this.silent = false;
+      var symbolType = data.getItemVisual(idx, 'symbol') || 'circle';
+      var seriesModel = data.hostModel;
+      var symbolSize = Symbol.getSymbolSize(data, idx);
+      var isInit = symbolType !== this._symbolType;
+      var disableAnimation = opts && opts.disableAnimation;
+
+      if (isInit) {
+        var keepAspect = data.getItemVisual(idx, 'symbolKeepAspect');
+
+        this._createSymbol(symbolType, data, idx, symbolSize, keepAspect);
+      } else {
+        var symbolPath = this.childAt(0);
+        symbolPath.silent = false;
+        var target = {
+          scaleX: symbolSize[0] / 2,
+          scaleY: symbolSize[1] / 2
+        };
+        disableAnimation ? symbolPath.attr(target) : updateProps(symbolPath, target, seriesModel, idx);
+        saveOldStyle(symbolPath);
+      }
+
+      this._updateCommon(data, idx, symbolSize, seriesScope, opts);
+
+      if (isInit) {
+        var symbolPath = this.childAt(0);
+
+        if (!disableAnimation) {
+          var target = {
+            scaleX: this._sizeX,
+            scaleY: this._sizeY,
+            style: {
+              // Always fadeIn. Because it has fadeOut animation when symbol is removed..
+              opacity: symbolPath.style.opacity
+            }
+          };
+          symbolPath.scaleX = symbolPath.scaleY = 0;
+          symbolPath.style.opacity = 0;
+          initProps(symbolPath, target, seriesModel, idx);
+        }
+      }
+
+      if (disableAnimation) {
+        // Must stop leave transition manually if don't call initProps or updateProps.
+        this.childAt(0).stopAnimation('leave');
+      }
+    };
+
+    Symbol.prototype._updateCommon = function (data, idx, symbolSize, seriesScope, opts) {
+      var symbolPath = this.childAt(0);
+      var seriesModel = data.hostModel;
+      var emphasisItemStyle;
+      var blurItemStyle;
+      var selectItemStyle;
+      var focus;
+      var blurScope;
+      var emphasisDisabled;
+      var labelStatesModels;
+      var hoverScale;
+      var cursorStyle;
+
+      if (seriesScope) {
+        emphasisItemStyle = seriesScope.emphasisItemStyle;
+        blurItemStyle = seriesScope.blurItemStyle;
+        selectItemStyle = seriesScope.selectItemStyle;
+        focus = seriesScope.focus;
+        blurScope = seriesScope.blurScope;
+        labelStatesModels = seriesScope.labelStatesModels;
+        hoverScale = seriesScope.hoverScale;
+        cursorStyle = seriesScope.cursorStyle;
+        emphasisDisabled = seriesScope.emphasisDisabled;
+      }
+
+      if (!seriesScope || data.hasItemOption) {
+        var itemModel = seriesScope && seriesScope.itemModel ? seriesScope.itemModel : data.getItemModel(idx);
+        var emphasisModel = itemModel.getModel('emphasis');
+        emphasisItemStyle = emphasisModel.getModel('itemStyle').getItemStyle();
+        selectItemStyle = itemModel.getModel(['select', 'itemStyle']).getItemStyle();
+        blurItemStyle = itemModel.getModel(['blur', 'itemStyle']).getItemStyle();
+        focus = emphasisModel.get('focus');
+        blurScope = emphasisModel.get('blurScope');
+        emphasisDisabled = emphasisModel.get('disabled');
+        labelStatesModels = getLabelStatesModels(itemModel);
+        hoverScale = emphasisModel.getShallow('scale');
+        cursorStyle = itemModel.getShallow('cursor');
+      }
+
+      var symbolRotate = data.getItemVisual(idx, 'symbolRotate');
+      symbolPath.attr('rotation', (symbolRotate || 0) * Math.PI / 180 || 0);
+      var symbolOffset = normalizeSymbolOffset(data.getItemVisual(idx, 'symbolOffset'), symbolSize);
+
+      if (symbolOffset) {
+        symbolPath.x = symbolOffset[0];
+        symbolPath.y = symbolOffset[1];
+      }
+
+      cursorStyle && symbolPath.attr('cursor', cursorStyle);
+      var symbolStyle = data.getItemVisual(idx, 'style');
+      var visualColor = symbolStyle.fill;
+
+      if (symbolPath instanceof ZRImage) {
+        var pathStyle = symbolPath.style;
+        symbolPath.useStyle(extend({
+          // TODO other properties like x, y ?
+          image: pathStyle.image,
+          x: pathStyle.x,
+          y: pathStyle.y,
+          width: pathStyle.width,
+          height: pathStyle.height
+        }, symbolStyle));
+      } else {
+        if (symbolPath.__isEmptyBrush) {
+          // fill and stroke will be swapped if it's empty.
+          // So we cloned a new style to avoid it affecting the original style in visual storage.
+          // TODO Better implementation. No empty logic!
+          symbolPath.useStyle(extend({}, symbolStyle));
+        } else {
+          symbolPath.useStyle(symbolStyle);
+        } // Disable decal because symbol scale will been applied on the decal.
+
+
+        symbolPath.style.decal = null;
+        symbolPath.setColor(visualColor, opts && opts.symbolInnerColor);
+        symbolPath.style.strokeNoScale = true;
+      }
+
+      var liftZ = data.getItemVisual(idx, 'liftZ');
+      var z2Origin = this._z2;
+
+      if (liftZ != null) {
+        if (z2Origin == null) {
+          this._z2 = symbolPath.z2;
+          symbolPath.z2 += liftZ;
+        }
+      } else if (z2Origin != null) {
+        symbolPath.z2 = z2Origin;
+        this._z2 = null;
+      }
+
+      var useNameLabel = opts && opts.useNameLabel;
+      setLabelStyle(symbolPath, labelStatesModels, {
+        labelFetcher: seriesModel,
+        labelDataIndex: idx,
+        defaultText: getLabelDefaultText,
+        inheritColor: visualColor,
+        defaultOpacity: symbolStyle.opacity
+      }); // Do not execute util needed.
+
+      function getLabelDefaultText(idx) {
+        return useNameLabel ? data.getName(idx) : getDefaultLabel(data, idx);
+      }
+
+      this._sizeX = symbolSize[0] / 2;
+      this._sizeY = symbolSize[1] / 2;
+      var emphasisState = symbolPath.ensureState('emphasis');
+      emphasisState.style = emphasisItemStyle;
+      symbolPath.ensureState('select').style = selectItemStyle;
+      symbolPath.ensureState('blur').style = blurItemStyle; // null / undefined / true means to use default strategy.
+      // 0 / false / negative number / NaN / Infinity means no scale.
+
+      var scaleRatio = hoverScale == null || hoverScale === true ? Math.max(1.1, 3 / this._sizeY) // PENDING: restrict hoverScale > 1? It seems unreasonable to scale down
+      : isFinite(hoverScale) && hoverScale > 0 ? +hoverScale : 1; // always set scale to allow resetting
+
+      emphasisState.scaleX = this._sizeX * scaleRatio;
+      emphasisState.scaleY = this._sizeY * scaleRatio;
+      this.setSymbolScale(1);
+      toggleHoverEmphasis(this, focus, blurScope, emphasisDisabled);
+    };
+
+    Symbol.prototype.setSymbolScale = function (scale) {
+      this.scaleX = this.scaleY = scale;
+    };
+
+    Symbol.prototype.fadeOut = function (cb, seriesModel, opt) {
+      var symbolPath = this.childAt(0);
+      var dataIndex = getECData(this).dataIndex;
+      var animationOpt = opt && opt.animation; // Avoid mistaken hover when fading out
+
+      this.silent = symbolPath.silent = true; // Not show text when animating
+
+      if (opt && opt.fadeLabel) {
+        var textContent = symbolPath.getTextContent();
+
+        if (textContent) {
+          removeElement(textContent, {
+            style: {
+              opacity: 0
+            }
+          }, seriesModel, {
+            dataIndex: dataIndex,
+            removeOpt: animationOpt,
+            cb: function () {
+              symbolPath.removeTextContent();
+            }
+          });
+        }
+      } else {
+        symbolPath.removeTextContent();
+      }
+
+      removeElement(symbolPath, {
+        style: {
+          opacity: 0
+        },
+        scaleX: 0,
+        scaleY: 0
+      }, seriesModel, {
+        dataIndex: dataIndex,
+        cb: cb,
+        removeOpt: animationOpt
+      });
+    };
+
+    Symbol.getSymbolSize = function (data, idx) {
+      return normalizeSymbolSize(data.getItemVisual(idx, 'symbolSize'));
+    };
+
+    return Symbol;
+  }(Group);
+
+  function driftSymbol(dx, dy) {
+    this.parent.drift(dx, dy);
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function symbolNeedsDraw(data, point, idx, opt) {
+    return point && !isNaN(point[0]) && !isNaN(point[1]) && !(opt.isIgnore && opt.isIgnore(idx)) // We do not set clipShape on group, because it will cut part of
+    // the symbol element shape. We use the same clip shape here as
+    // the line clip.
+    && !(opt.clipShape && !opt.clipShape.contain(point[0], point[1])) && data.getItemVisual(idx, 'symbol') !== 'none';
+  }
+
+  function normalizeUpdateOpt(opt) {
+    if (opt != null && !isObject(opt)) {
+      opt = {
+        isIgnore: opt
+      };
+    }
+
+    return opt || {};
+  }
+
+  function makeSeriesScope(data) {
+    var seriesModel = data.hostModel;
+    var emphasisModel = seriesModel.getModel('emphasis');
+    return {
+      emphasisItemStyle: emphasisModel.getModel('itemStyle').getItemStyle(),
+      blurItemStyle: seriesModel.getModel(['blur', 'itemStyle']).getItemStyle(),
+      selectItemStyle: seriesModel.getModel(['select', 'itemStyle']).getItemStyle(),
+      focus: emphasisModel.get('focus'),
+      blurScope: emphasisModel.get('blurScope'),
+      emphasisDisabled: emphasisModel.get('disabled'),
+      hoverScale: emphasisModel.get('scale'),
+      labelStatesModels: getLabelStatesModels(seriesModel),
+      cursorStyle: seriesModel.get('cursor')
+    };
+  }
+
+  var SymbolDraw =
+  /** @class */
+  function () {
+    function SymbolDraw(SymbolCtor) {
+      this.group = new Group();
+      this._SymbolCtor = SymbolCtor || Symbol$1;
+    }
+    /**
+     * Update symbols draw by new data
+     */
+
+
+    SymbolDraw.prototype.updateData = function (data, opt) {
+      // Remove progressive els.
+      this._progressiveEls = null;
+      opt = normalizeUpdateOpt(opt);
+      var group = this.group;
+      var seriesModel = data.hostModel;
+      var oldData = this._data;
+      var SymbolCtor = this._SymbolCtor;
+      var disableAnimation = opt.disableAnimation;
+      var seriesScope = makeSeriesScope(data);
+      var symbolUpdateOpt = {
+        disableAnimation: disableAnimation
+      };
+
+      var getSymbolPoint = opt.getSymbolPoint || function (idx) {
+        return data.getItemLayout(idx);
+      }; // There is no oldLineData only when first rendering or switching from
+      // stream mode to normal mode, where previous elements should be removed.
+
+
+      if (!oldData) {
+        group.removeAll();
+      }
+
+      data.diff(oldData).add(function (newIdx) {
+        var point = getSymbolPoint(newIdx);
+
+        if (symbolNeedsDraw(data, point, newIdx, opt)) {
+          var symbolEl = new SymbolCtor(data, newIdx, seriesScope, symbolUpdateOpt);
+          symbolEl.setPosition(point);
+          data.setItemGraphicEl(newIdx, symbolEl);
+          group.add(symbolEl);
+        }
+      }).update(function (newIdx, oldIdx) {
+        var symbolEl = oldData.getItemGraphicEl(oldIdx);
+        var point = getSymbolPoint(newIdx);
+
+        if (!symbolNeedsDraw(data, point, newIdx, opt)) {
+          group.remove(symbolEl);
+          return;
+        }
+
+        var newSymbolType = data.getItemVisual(newIdx, 'symbol') || 'circle';
+        var oldSymbolType = symbolEl && symbolEl.getSymbolType && symbolEl.getSymbolType();
+
+        if (!symbolEl // Create a new if symbol type changed.
+        || oldSymbolType && oldSymbolType !== newSymbolType) {
+          group.remove(symbolEl);
+          symbolEl = new SymbolCtor(data, newIdx, seriesScope, symbolUpdateOpt);
+          symbolEl.setPosition(point);
+        } else {
+          symbolEl.updateData(data, newIdx, seriesScope, symbolUpdateOpt);
+          var target = {
+            x: point[0],
+            y: point[1]
+          };
+          disableAnimation ? symbolEl.attr(target) : updateProps(symbolEl, target, seriesModel);
+        } // Add back
+
+
+        group.add(symbolEl);
+        data.setItemGraphicEl(newIdx, symbolEl);
+      }).remove(function (oldIdx) {
+        var el = oldData.getItemGraphicEl(oldIdx);
+        el && el.fadeOut(function () {
+          group.remove(el);
+        }, seriesModel);
+      }).execute();
+      this._getSymbolPoint = getSymbolPoint;
+      this._data = data;
+    };
+
+    SymbolDraw.prototype.updateLayout = function () {
+      var _this = this;
+
+      var data = this._data;
+
+      if (data) {
+        // Not use animation
+        data.eachItemGraphicEl(function (el, idx) {
+          var point = _this._getSymbolPoint(idx);
+
+          el.setPosition(point);
+          el.markRedraw();
+        });
+      }
+    };
+
+    SymbolDraw.prototype.incrementalPrepareUpdate = function (data) {
+      this._seriesScope = makeSeriesScope(data);
+      this._data = null;
+      this.group.removeAll();
+    };
+    /**
+     * Update symbols draw by new data
+     */
+
+
+    SymbolDraw.prototype.incrementalUpdate = function (taskParams, data, opt) {
+      // Clear
+      this._progressiveEls = [];
+      opt = normalizeUpdateOpt(opt);
+
+      function updateIncrementalAndHover(el) {
+        if (!el.isGroup) {
+          el.incremental = true;
+          el.ensureState('emphasis').hoverLayer = true;
+        }
+      }
+
+      for (var idx = taskParams.start; idx < taskParams.end; idx++) {
+        var point = data.getItemLayout(idx);
+
+        if (symbolNeedsDraw(data, point, idx, opt)) {
+          var el = new this._SymbolCtor(data, idx, this._seriesScope);
+          el.traverse(updateIncrementalAndHover);
+          el.setPosition(point);
+          this.group.add(el);
+          data.setItemGraphicEl(idx, el);
+
+          this._progressiveEls.push(el);
+        }
+      }
+    };
+
+    SymbolDraw.prototype.eachRendered = function (cb) {
+      traverseElements(this._progressiveEls || this.group, cb);
+    };
+
+    SymbolDraw.prototype.remove = function (enableAnimation) {
+      var group = this.group;
+      var data = this._data; // Incremental model do not have this._data.
+
+      if (data && enableAnimation) {
+        data.eachItemGraphicEl(function (el) {
+          el.fadeOut(function () {
+            group.remove(el);
+          }, data.hostModel);
+        });
+      } else {
+        group.removeAll();
+      }
+    };
+
+    return SymbolDraw;
+  }();
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function prepareDataCoordInfo(coordSys, data, valueOrigin) {
+    var baseAxis = coordSys.getBaseAxis();
+    var valueAxis = coordSys.getOtherAxis(baseAxis);
+    var valueStart = getValueStart(valueAxis, valueOrigin);
+    var baseAxisDim = baseAxis.dim;
+    var valueAxisDim = valueAxis.dim;
+    var valueDim = data.mapDimension(valueAxisDim);
+    var baseDim = data.mapDimension(baseAxisDim);
+    var baseDataOffset = valueAxisDim === 'x' || valueAxisDim === 'radius' ? 1 : 0;
+    var dims = map(coordSys.dimensions, function (coordDim) {
+      return data.mapDimension(coordDim);
+    });
+    var stacked = false;
+    var stackResultDim = data.getCalculationInfo('stackResultDimension');
+
+    if (isDimensionStacked(data, dims[0]
+    /* , dims[1] */
+    )) {
+      // jshint ignore:line
+      stacked = true;
+      dims[0] = stackResultDim;
+    }
+
+    if (isDimensionStacked(data, dims[1]
+    /* , dims[0] */
+    )) {
+      // jshint ignore:line
+      stacked = true;
+      dims[1] = stackResultDim;
+    }
+
+    return {
+      dataDimsForPoint: dims,
+      valueStart: valueStart,
+      valueAxisDim: valueAxisDim,
+      baseAxisDim: baseAxisDim,
+      stacked: !!stacked,
+      valueDim: valueDim,
+      baseDim: baseDim,
+      baseDataOffset: baseDataOffset,
+      stackedOverDimension: data.getCalculationInfo('stackedOverDimension')
+    };
+  }
+
+  function getValueStart(valueAxis, valueOrigin) {
+    var valueStart = 0;
+    var extent = valueAxis.scale.getExtent();
+
+    if (valueOrigin === 'start') {
+      valueStart = extent[0];
+    } else if (valueOrigin === 'end') {
+      valueStart = extent[1];
+    } // If origin is specified as a number, use it as
+    // valueStart directly
+    else if (isNumber(valueOrigin) && !isNaN(valueOrigin)) {
+        valueStart = valueOrigin;
+      } // auto
+      else {
+          // Both positive
+          if (extent[0] > 0) {
+            valueStart = extent[0];
+          } // Both negative
+          else if (extent[1] < 0) {
+              valueStart = extent[1];
+            } // If is one positive, and one negative, onZero shall be true
+
+        }
+
+    return valueStart;
+  }
+
+  function getStackedOnPoint(dataCoordInfo, coordSys, data, idx) {
+    var value = NaN;
+
+    if (dataCoordInfo.stacked) {
+      value = data.get(data.getCalculationInfo('stackedOverDimension'), idx);
+    }
+
+    if (isNaN(value)) {
+      value = dataCoordInfo.valueStart;
+    }
+
+    var baseDataOffset = dataCoordInfo.baseDataOffset;
+    var stackedData = [];
+    stackedData[baseDataOffset] = data.get(dataCoordInfo.baseDim, idx);
+    stackedData[1 - baseDataOffset] = value;
+    return coordSys.dataToPoint(stackedData);
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function diffData(oldData, newData) {
+    var diffResult = [];
+    newData.diff(oldData).add(function (idx) {
+      diffResult.push({
+        cmd: '+',
+        idx: idx
+      });
+    }).update(function (newIdx, oldIdx) {
+      diffResult.push({
+        cmd: '=',
+        idx: oldIdx,
+        idx1: newIdx
+      });
+    }).remove(function (idx) {
+      diffResult.push({
+        cmd: '-',
+        idx: idx
+      });
+    }).execute();
+    return diffResult;
+  }
+
+  function lineAnimationDiff(oldData, newData, oldStackedOnPoints, newStackedOnPoints, oldCoordSys, newCoordSys, oldValueOrigin, newValueOrigin) {
+    var diff = diffData(oldData, newData); // let newIdList = newData.mapArray(newData.getId);
+    // let oldIdList = oldData.mapArray(oldData.getId);
+    // convertToIntId(newIdList, oldIdList);
+    // // FIXME One data ?
+    // diff = arrayDiff(oldIdList, newIdList);
+
+    var currPoints = [];
+    var nextPoints = []; // Points for stacking base line
+
+    var currStackedPoints = [];
+    var nextStackedPoints = [];
+    var status = [];
+    var sortedIndices = [];
+    var rawIndices = [];
+    var newDataOldCoordInfo = prepareDataCoordInfo(oldCoordSys, newData, oldValueOrigin); // const oldDataNewCoordInfo = prepareDataCoordInfo(newCoordSys, oldData, newValueOrigin);
+
+    var oldPoints = oldData.getLayout('points') || [];
+    var newPoints = newData.getLayout('points') || [];
+
+    for (var i = 0; i < diff.length; i++) {
+      var diffItem = diff[i];
+      var pointAdded = true;
+      var oldIdx2 = void 0;
+      var newIdx2 = void 0; // FIXME, animation is not so perfect when dataZoom window moves fast
+      // Which is in case remvoing or add more than one data in the tail or head
+
+      switch (diffItem.cmd) {
+        case '=':
+          oldIdx2 = diffItem.idx * 2;
+          newIdx2 = diffItem.idx1 * 2;
+          var currentX = oldPoints[oldIdx2];
+          var currentY = oldPoints[oldIdx2 + 1];
+          var nextX = newPoints[newIdx2];
+          var nextY = newPoints[newIdx2 + 1]; // If previous data is NaN, use next point directly
+
+          if (isNaN(currentX) || isNaN(currentY)) {
+            currentX = nextX;
+            currentY = nextY;
+          }
+
+          currPoints.push(currentX, currentY);
+          nextPoints.push(nextX, nextY);
+          currStackedPoints.push(oldStackedOnPoints[oldIdx2], oldStackedOnPoints[oldIdx2 + 1]);
+          nextStackedPoints.push(newStackedOnPoints[newIdx2], newStackedOnPoints[newIdx2 + 1]);
+          rawIndices.push(newData.getRawIndex(diffItem.idx1));
+          break;
+
+        case '+':
+          var newIdx = diffItem.idx;
+          var newDataDimsForPoint = newDataOldCoordInfo.dataDimsForPoint;
+          var oldPt = oldCoordSys.dataToPoint([newData.get(newDataDimsForPoint[0], newIdx), newData.get(newDataDimsForPoint[1], newIdx)]);
+          newIdx2 = newIdx * 2;
+          currPoints.push(oldPt[0], oldPt[1]);
+          nextPoints.push(newPoints[newIdx2], newPoints[newIdx2 + 1]);
+          var stackedOnPoint = getStackedOnPoint(newDataOldCoordInfo, oldCoordSys, newData, newIdx);
+          currStackedPoints.push(stackedOnPoint[0], stackedOnPoint[1]);
+          nextStackedPoints.push(newStackedOnPoints[newIdx2], newStackedOnPoints[newIdx2 + 1]);
+          rawIndices.push(newData.getRawIndex(newIdx));
+          break;
+
+        case '-':
+          pointAdded = false;
+      } // Original indices
+
+
+      if (pointAdded) {
+        status.push(diffItem);
+        sortedIndices.push(sortedIndices.length);
+      }
+    } // Diff result may be crossed if all items are changed
+    // Sort by data index
+
+
+    sortedIndices.sort(function (a, b) {
+      return rawIndices[a] - rawIndices[b];
+    });
+    var len = currPoints.length;
+    var sortedCurrPoints = createFloat32Array(len);
+    var sortedNextPoints = createFloat32Array(len);
+    var sortedCurrStackedPoints = createFloat32Array(len);
+    var sortedNextStackedPoints = createFloat32Array(len);
+    var sortedStatus = [];
+
+    for (var i = 0; i < sortedIndices.length; i++) {
+      var idx = sortedIndices[i];
+      var i2 = i * 2;
+      var idx2 = idx * 2;
+      sortedCurrPoints[i2] = currPoints[idx2];
+      sortedCurrPoints[i2 + 1] = currPoints[idx2 + 1];
+      sortedNextPoints[i2] = nextPoints[idx2];
+      sortedNextPoints[i2 + 1] = nextPoints[idx2 + 1];
+      sortedCurrStackedPoints[i2] = currStackedPoints[idx2];
+      sortedCurrStackedPoints[i2 + 1] = currStackedPoints[idx2 + 1];
+      sortedNextStackedPoints[i2] = nextStackedPoints[idx2];
+      sortedNextStackedPoints[i2 + 1] = nextStackedPoints[idx2 + 1];
+      sortedStatus[i] = status[idx];
+    }
+
+    return {
+      current: sortedCurrPoints,
+      next: sortedNextPoints,
+      stackedOnCurrent: sortedCurrStackedPoints,
+      stackedOnNext: sortedNextStackedPoints,
+      status: sortedStatus
+    };
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var mathMin$5 = Math.min;
+  var mathMax$5 = Math.max;
+
+  function isPointNull$1(x, y) {
+    return isNaN(x) || isNaN(y);
+  }
+  /**
+   * Draw smoothed line in non-monotone, in may cause undesired curve in extreme
+   * situations. This should be used when points are non-monotone neither in x or
+   * y dimension.
+   */
+
+
+  function drawSegment(ctx, points, start, segLen, allLen, dir, smooth, smoothMonotone, connectNulls) {
+    var prevX;
+    var prevY;
+    var cpx0;
+    var cpy0;
+    var cpx1;
+    var cpy1;
+    var idx = start;
+    var k = 0;
+
+    for (; k < segLen; k++) {
+      var x = points[idx * 2];
+      var y = points[idx * 2 + 1];
+
+      if (idx >= allLen || idx < 0) {
+        break;
+      }
+
+      if (isPointNull$1(x, y)) {
+        if (connectNulls) {
+          idx += dir;
+          continue;
+        }
+
+        break;
+      }
+
+      if (idx === start) {
+        ctx[dir > 0 ? 'moveTo' : 'lineTo'](x, y);
+        cpx0 = x;
+        cpy0 = y;
+      } else {
+        var dx = x - prevX;
+        var dy = y - prevY; // Ignore tiny segment.
+
+        if (dx * dx + dy * dy < 0.5) {
+          idx += dir;
+          continue;
+        }
+
+        if (smooth > 0) {
+          var nextIdx = idx + dir;
+          var nextX = points[nextIdx * 2];
+          var nextY = points[nextIdx * 2 + 1]; // Ignore duplicate point
+
+          while (nextX === x && nextY === y && k < segLen) {
+            k++;
+            nextIdx += dir;
+            idx += dir;
+            nextX = points[nextIdx * 2];
+            nextY = points[nextIdx * 2 + 1];
+            x = points[idx * 2];
+            y = points[idx * 2 + 1];
+            dx = x - prevX;
+            dy = y - prevY;
+          }
+
+          var tmpK = k + 1;
+
+          if (connectNulls) {
+            // Find next point not null
+            while (isPointNull$1(nextX, nextY) && tmpK < segLen) {
+              tmpK++;
+              nextIdx += dir;
+              nextX = points[nextIdx * 2];
+              nextY = points[nextIdx * 2 + 1];
+            }
+          }
+
+          var ratioNextSeg = 0.5;
+          var vx = 0;
+          var vy = 0;
+          var nextCpx0 = void 0;
+          var nextCpy0 = void 0; // Is last point
+
+          if (tmpK >= segLen || isPointNull$1(nextX, nextY)) {
+            cpx1 = x;
+            cpy1 = y;
+          } else {
+            vx = nextX - prevX;
+            vy = nextY - prevY;
+            var dx0 = x - prevX;
+            var dx1 = nextX - x;
+            var dy0 = y - prevY;
+            var dy1 = nextY - y;
+            var lenPrevSeg = void 0;
+            var lenNextSeg = void 0;
+
+            if (smoothMonotone === 'x') {
+              lenPrevSeg = Math.abs(dx0);
+              lenNextSeg = Math.abs(dx1);
+              var dir_1 = vx > 0 ? 1 : -1;
+              cpx1 = x - dir_1 * lenPrevSeg * smooth;
+              cpy1 = y;
+              nextCpx0 = x + dir_1 * lenNextSeg * smooth;
+              nextCpy0 = y;
+            } else if (smoothMonotone === 'y') {
+              lenPrevSeg = Math.abs(dy0);
+              lenNextSeg = Math.abs(dy1);
+              var dir_2 = vy > 0 ? 1 : -1;
+              cpx1 = x;
+              cpy1 = y - dir_2 * lenPrevSeg * smooth;
+              nextCpx0 = x;
+              nextCpy0 = y + dir_2 * lenNextSeg * smooth;
+            } else {
+              lenPrevSeg = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+              lenNextSeg = Math.sqrt(dx1 * dx1 + dy1 * dy1); // Use ratio of seg length
+
+              ratioNextSeg = lenNextSeg / (lenNextSeg + lenPrevSeg);
+              cpx1 = x - vx * smooth * (1 - ratioNextSeg);
+              cpy1 = y - vy * smooth * (1 - ratioNextSeg); // cp0 of next segment
+
+              nextCpx0 = x + vx * smooth * ratioNextSeg;
+              nextCpy0 = y + vy * smooth * ratioNextSeg; // Smooth constraint between point and next point.
+              // Avoid exceeding extreme after smoothing.
+
+              nextCpx0 = mathMin$5(nextCpx0, mathMax$5(nextX, x));
+              nextCpy0 = mathMin$5(nextCpy0, mathMax$5(nextY, y));
+              nextCpx0 = mathMax$5(nextCpx0, mathMin$5(nextX, x));
+              nextCpy0 = mathMax$5(nextCpy0, mathMin$5(nextY, y)); // Reclaculate cp1 based on the adjusted cp0 of next seg.
+
+              vx = nextCpx0 - x;
+              vy = nextCpy0 - y;
+              cpx1 = x - vx * lenPrevSeg / lenNextSeg;
+              cpy1 = y - vy * lenPrevSeg / lenNextSeg; // Smooth constraint between point and prev point.
+              // Avoid exceeding extreme after smoothing.
+
+              cpx1 = mathMin$5(cpx1, mathMax$5(prevX, x));
+              cpy1 = mathMin$5(cpy1, mathMax$5(prevY, y));
+              cpx1 = mathMax$5(cpx1, mathMin$5(prevX, x));
+              cpy1 = mathMax$5(cpy1, mathMin$5(prevY, y)); // Adjust next cp0 again.
+
+              vx = x - cpx1;
+              vy = y - cpy1;
+              nextCpx0 = x + vx * lenNextSeg / lenPrevSeg;
+              nextCpy0 = y + vy * lenNextSeg / lenPrevSeg;
+            }
+          }
+
+          ctx.bezierCurveTo(cpx0, cpy0, cpx1, cpy1, x, y);
+          cpx0 = nextCpx0;
+          cpy0 = nextCpy0;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+
+      prevX = x;
+      prevY = y;
+      idx += dir;
+    }
+
+    return k;
+  }
+
+  var ECPolylineShape =
+  /** @class */
+  function () {
+    function ECPolylineShape() {
+      this.smooth = 0;
+      this.smoothConstraint = true;
+    }
+
+    return ECPolylineShape;
+  }();
+
+  var ECPolyline =
+  /** @class */
+  function (_super) {
+    __extends(ECPolyline, _super);
+
+    function ECPolyline(opts) {
+      var _this = _super.call(this, opts) || this;
+
+      _this.type = 'ec-polyline';
+      return _this;
+    }
+
+    ECPolyline.prototype.getDefaultStyle = function () {
+      return {
+        stroke: '#000',
+        fill: null
+      };
+    };
+
+    ECPolyline.prototype.getDefaultShape = function () {
+      return new ECPolylineShape();
+    };
+
+    ECPolyline.prototype.buildPath = function (ctx, shape) {
+      var points = shape.points;
+      var i = 0;
+      var len = points.length / 2; // const result = getBoundingBox(points, shape.smoothConstraint);
+
+      if (shape.connectNulls) {
+        // Must remove first and last null values avoid draw error in polygon
+        for (; len > 0; len--) {
+          if (!isPointNull$1(points[len * 2 - 2], points[len * 2 - 1])) {
+            break;
+          }
+        }
+
+        for (; i < len; i++) {
+          if (!isPointNull$1(points[i * 2], points[i * 2 + 1])) {
+            break;
+          }
+        }
+      }
+
+      while (i < len) {
+        i += drawSegment(ctx, points, i, len, len, 1, shape.smooth, shape.smoothMonotone, shape.connectNulls) + 1;
+      }
+    };
+
+    ECPolyline.prototype.getPointOn = function (xOrY, dim) {
+      if (!this.path) {
+        this.createPathProxy();
+        this.buildPath(this.path, this.shape);
+      }
+
+      var path = this.path;
+      var data = path.data;
+      var CMD = PathProxy.CMD;
+      var x0;
+      var y0;
+      var isDimX = dim === 'x';
+      var roots = [];
+
+      for (var i = 0; i < data.length;) {
+        var cmd = data[i++];
+        var x = void 0;
+        var y = void 0;
+        var x2 = void 0;
+        var y2 = void 0;
+        var x3 = void 0;
+        var y3 = void 0;
+        var t = void 0;
+
+        switch (cmd) {
+          case CMD.M:
+            x0 = data[i++];
+            y0 = data[i++];
+            break;
+
+          case CMD.L:
+            x = data[i++];
+            y = data[i++];
+            t = isDimX ? (xOrY - x0) / (x - x0) : (xOrY - y0) / (y - y0);
+
+            if (t <= 1 && t >= 0) {
+              var val = isDimX ? (y - y0) * t + y0 : (x - x0) * t + x0;
+              return isDimX ? [xOrY, val] : [val, xOrY];
+            }
+
+            x0 = x;
+            y0 = y;
+            break;
+
+          case CMD.C:
+            x = data[i++];
+            y = data[i++];
+            x2 = data[i++];
+            y2 = data[i++];
+            x3 = data[i++];
+            y3 = data[i++];
+            var nRoot = isDimX ? cubicRootAt(x0, x, x2, x3, xOrY, roots) : cubicRootAt(y0, y, y2, y3, xOrY, roots);
+
+            if (nRoot > 0) {
+              for (var i_1 = 0; i_1 < nRoot; i_1++) {
+                var t_1 = roots[i_1];
+
+                if (t_1 <= 1 && t_1 >= 0) {
+                  var val = isDimX ? cubicAt(y0, y, y2, y3, t_1) : cubicAt(x0, x, x2, x3, t_1);
+                  return isDimX ? [xOrY, val] : [val, xOrY];
+                }
+              }
+            }
+
+            x0 = x3;
+            y0 = y3;
+            break;
+        }
+      }
+    };
+
+    return ECPolyline;
+  }(Path);
+
+  var ECPolygonShape =
+  /** @class */
+  function (_super) {
+    __extends(ECPolygonShape, _super);
+
+    function ECPolygonShape() {
+      return _super !== null && _super.apply(this, arguments) || this;
+    }
+
+    return ECPolygonShape;
+  }(ECPolylineShape);
+
+  var ECPolygon =
+  /** @class */
+  function (_super) {
+    __extends(ECPolygon, _super);
+
+    function ECPolygon(opts) {
+      var _this = _super.call(this, opts) || this;
+
+      _this.type = 'ec-polygon';
+      return _this;
+    }
+
+    ECPolygon.prototype.getDefaultShape = function () {
+      return new ECPolygonShape();
+    };
+
+    ECPolygon.prototype.buildPath = function (ctx, shape) {
+      var points = shape.points;
+      var stackedOnPoints = shape.stackedOnPoints;
+      var i = 0;
+      var len = points.length / 2;
+      var smoothMonotone = shape.smoothMonotone;
+
+      if (shape.connectNulls) {
+        // Must remove first and last null values avoid draw error in polygon
+        for (; len > 0; len--) {
+          if (!isPointNull$1(points[len * 2 - 2], points[len * 2 - 1])) {
+            break;
+          }
+        }
+
+        for (; i < len; i++) {
+          if (!isPointNull$1(points[i * 2], points[i * 2 + 1])) {
+            break;
+          }
+        }
+      }
+
+      while (i < len) {
+        var k = drawSegment(ctx, points, i, len, len, 1, shape.smooth, smoothMonotone, shape.connectNulls);
+        drawSegment(ctx, stackedOnPoints, i + k - 1, k, len, -1, shape.stackedOnSmooth, smoothMonotone, shape.connectNulls);
+        i += k + 1;
+        ctx.closePath();
+      }
+    };
+
+    return ECPolygon;
+  }(Path);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function createGridClipPath(cartesian, hasAnimation, seriesModel, done, during) {
+    var rect = cartesian.getArea();
+    var x = rect.x;
+    var y = rect.y;
+    var width = rect.width;
+    var height = rect.height;
+    var lineWidth = seriesModel.get(['lineStyle', 'width']) || 2; // Expand the clip path a bit to avoid the border is clipped and looks thinner
+
+    x -= lineWidth / 2;
+    y -= lineWidth / 2;
+    width += lineWidth;
+    height += lineWidth; // fix: https://github.com/apache/incubator-echarts/issues/11369
+
+    x = Math.floor(x);
+    width = Math.round(width);
+    var clipPath = new Rect({
+      shape: {
+        x: x,
+        y: y,
+        width: width,
+        height: height
+      }
+    });
+
+    if (hasAnimation) {
+      var baseAxis = cartesian.getBaseAxis();
+      var isHorizontal = baseAxis.isHorizontal();
+      var isAxisInversed = baseAxis.inverse;
+
+      if (isHorizontal) {
+        if (isAxisInversed) {
+          clipPath.shape.x += width;
+        }
+
+        clipPath.shape.width = 0;
+      } else {
+        if (!isAxisInversed) {
+          clipPath.shape.y += height;
+        }
+
+        clipPath.shape.height = 0;
+      }
+
+      var duringCb = isFunction(during) ? function (percent) {
+        during(percent, clipPath);
+      } : null;
+      initProps(clipPath, {
+        shape: {
+          width: width,
+          height: height,
+          x: x,
+          y: y
+        }
+      }, seriesModel, null, done, duringCb);
+    }
+
+    return clipPath;
+  }
+
+  function createPolarClipPath(polar, hasAnimation, seriesModel) {
+    var sectorArea = polar.getArea(); // Avoid float number rounding error for symbol on the edge of axis extent.
+
+    var r0 = round(sectorArea.r0, 1);
+    var r = round(sectorArea.r, 1);
+    var clipPath = new Sector({
+      shape: {
+        cx: round(polar.cx, 1),
+        cy: round(polar.cy, 1),
+        r0: r0,
+        r: r,
+        startAngle: sectorArea.startAngle,
+        endAngle: sectorArea.endAngle,
+        clockwise: sectorArea.clockwise
+      }
+    });
+
+    if (hasAnimation) {
+      var isRadial = polar.getBaseAxis().dim === 'angle';
+
+      if (isRadial) {
+        clipPath.shape.endAngle = sectorArea.startAngle;
+      } else {
+        clipPath.shape.r = r0;
+      }
+
+      initProps(clipPath, {
+        shape: {
+          endAngle: sectorArea.endAngle,
+          r: r
+        }
+      }, seriesModel);
+    }
+
+    return clipPath;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function isCoordinateSystemType(coordSys, type) {
+    return coordSys.type === type;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function isPointsSame(points1, points2) {
+    if (points1.length !== points2.length) {
+      return;
+    }
+
+    for (var i = 0; i < points1.length; i++) {
+      if (points1[i] !== points2[i]) {
+        return;
+      }
+    }
+
+    return true;
+  }
+
+  function bboxFromPoints(points) {
+    var minX = Infinity;
+    var minY = Infinity;
+    var maxX = -Infinity;
+    var maxY = -Infinity;
+
+    for (var i = 0; i < points.length;) {
+      var x = points[i++];
+      var y = points[i++];
+
+      if (!isNaN(x)) {
+        minX = Math.min(x, minX);
+        maxX = Math.max(x, maxX);
+      }
+
+      if (!isNaN(y)) {
+        minY = Math.min(y, minY);
+        maxY = Math.max(y, maxY);
+      }
+    }
+
+    return [[minX, minY], [maxX, maxY]];
+  }
+
+  function getBoundingDiff(points1, points2) {
+    var _a = bboxFromPoints(points1),
+        min1 = _a[0],
+        max1 = _a[1];
+
+    var _b = bboxFromPoints(points2),
+        min2 = _b[0],
+        max2 = _b[1]; // Get a max value from each corner of two boundings.
+
+
+    return Math.max(Math.abs(min1[0] - min2[0]), Math.abs(min1[1] - min2[1]), Math.abs(max1[0] - max2[0]), Math.abs(max1[1] - max2[1]));
+  }
+
+  function getSmooth(smooth) {
+    return isNumber(smooth) ? smooth : smooth ? 0.5 : 0;
+  }
+
+  function getStackedOnPoints(coordSys, data, dataCoordInfo) {
+    if (!dataCoordInfo.valueDim) {
+      return [];
+    }
+
+    var len = data.count();
+    var points = createFloat32Array(len * 2);
+
+    for (var idx = 0; idx < len; idx++) {
+      var pt = getStackedOnPoint(dataCoordInfo, coordSys, data, idx);
+      points[idx * 2] = pt[0];
+      points[idx * 2 + 1] = pt[1];
+    }
+
+    return points;
+  }
+
+  function turnPointsIntoStep(points, coordSys, stepTurnAt, connectNulls) {
+    var baseAxis = coordSys.getBaseAxis();
+    var baseIndex = baseAxis.dim === 'x' || baseAxis.dim === 'radius' ? 0 : 1;
+    var stepPoints = [];
+    var i = 0;
+    var stepPt = [];
+    var pt = [];
+    var nextPt = [];
+    var filteredPoints = [];
+
+    if (connectNulls) {
+      for (i = 0; i < points.length; i += 2) {
+        if (!isNaN(points[i]) && !isNaN(points[i + 1])) {
+          filteredPoints.push(points[i], points[i + 1]);
+        }
+      }
+
+      points = filteredPoints;
+    }
+
+    for (i = 0; i < points.length - 2; i += 2) {
+      nextPt[0] = points[i + 2];
+      nextPt[1] = points[i + 3];
+      pt[0] = points[i];
+      pt[1] = points[i + 1];
+      stepPoints.push(pt[0], pt[1]);
+
+      switch (stepTurnAt) {
+        case 'end':
+          stepPt[baseIndex] = nextPt[baseIndex];
+          stepPt[1 - baseIndex] = pt[1 - baseIndex];
+          stepPoints.push(stepPt[0], stepPt[1]);
+          break;
+
+        case 'middle':
+          var middle = (pt[baseIndex] + nextPt[baseIndex]) / 2;
+          var stepPt2 = [];
+          stepPt[baseIndex] = stepPt2[baseIndex] = middle;
+          stepPt[1 - baseIndex] = pt[1 - baseIndex];
+          stepPt2[1 - baseIndex] = nextPt[1 - baseIndex];
+          stepPoints.push(stepPt[0], stepPt[1]);
+          stepPoints.push(stepPt2[0], stepPt2[1]);
+          break;
+
+        default:
+          // default is start
+          stepPt[baseIndex] = pt[baseIndex];
+          stepPt[1 - baseIndex] = nextPt[1 - baseIndex];
+          stepPoints.push(stepPt[0], stepPt[1]);
+      }
+    } // Last points
+
+
+    stepPoints.push(points[i++], points[i++]);
+    return stepPoints;
+  }
+  /**
+   * Clip color stops to edge. Avoid creating too large gradients.
+   * Which may lead to blurry when GPU acceleration is enabled. See #15680
+   *
+   * The stops has been sorted from small to large.
+   */
+
+
+  function clipColorStops(colorStops, maxSize) {
+    var newColorStops = [];
+    var len = colorStops.length; // coord will always < 0 in prevOutOfRangeColorStop.
+
+    var prevOutOfRangeColorStop;
+    var prevInRangeColorStop;
+
+    function lerpStop(stop0, stop1, clippedCoord) {
+      var coord0 = stop0.coord;
+      var p = (clippedCoord - coord0) / (stop1.coord - coord0);
+      var color = lerp$1(p, [stop0.color, stop1.color]);
+      return {
+        coord: clippedCoord,
+        color: color
+      };
+    }
+
+    for (var i = 0; i < len; i++) {
+      var stop_1 = colorStops[i];
+      var coord = stop_1.coord;
+
+      if (coord < 0) {
+        prevOutOfRangeColorStop = stop_1;
+      } else if (coord > maxSize) {
+        if (prevInRangeColorStop) {
+          newColorStops.push(lerpStop(prevInRangeColorStop, stop_1, maxSize));
+        } else if (prevOutOfRangeColorStop) {
+          // If there are two stops and coord range is between these two stops
+          newColorStops.push(lerpStop(prevOutOfRangeColorStop, stop_1, 0), lerpStop(prevOutOfRangeColorStop, stop_1, maxSize));
+        } // All following stop will be out of range. So just ignore them.
+
+
+        break;
+      } else {
+        if (prevOutOfRangeColorStop) {
+          newColorStops.push(lerpStop(prevOutOfRangeColorStop, stop_1, 0)); // Reset
+
+          prevOutOfRangeColorStop = null;
+        }
+
+        newColorStops.push(stop_1);
+        prevInRangeColorStop = stop_1;
+      }
+    }
+
+    return newColorStops;
+  }
+
+  function getVisualGradient(data, coordSys, api) {
+    var visualMetaList = data.getVisual('visualMeta');
+
+    if (!visualMetaList || !visualMetaList.length || !data.count()) {
+      // When data.count() is 0, gradient range can not be calculated.
+      return;
+    }
+
+    if (coordSys.type !== 'cartesian2d') {
+      {
+        console.warn('Visual map on line style is only supported on cartesian2d.');
+      }
+      return;
+    }
+
+    var coordDim;
+    var visualMeta;
+
+    for (var i = visualMetaList.length - 1; i >= 0; i--) {
+      var dimInfo = data.getDimensionInfo(visualMetaList[i].dimension);
+      coordDim = dimInfo && dimInfo.coordDim; // Can only be x or y
+
+      if (coordDim === 'x' || coordDim === 'y') {
+        visualMeta = visualMetaList[i];
+        break;
+      }
+    }
+
+    if (!visualMeta) {
+      {
+        console.warn('Visual map on line style only support x or y dimension.');
+      }
+      return;
+    } // If the area to be rendered is bigger than area defined by LinearGradient,
+    // the canvas spec prescribes that the color of the first stop and the last
+    // stop should be used. But if two stops are added at offset 0, in effect
+    // browsers use the color of the second stop to render area outside
+    // LinearGradient. So we can only infinitesimally extend area defined in
+    // LinearGradient to render `outerColors`.
+
+
+    var axis = coordSys.getAxis(coordDim); // dataToCoord mapping may not be linear, but must be monotonic.
+
+    var colorStops = map(visualMeta.stops, function (stop) {
+      // offset will be calculated later.
+      return {
+        coord: axis.toGlobalCoord(axis.dataToCoord(stop.value)),
+        color: stop.color
+      };
+    });
+    var stopLen = colorStops.length;
+    var outerColors = visualMeta.outerColors.slice();
+
+    if (stopLen && colorStops[0].coord > colorStops[stopLen - 1].coord) {
+      colorStops.reverse();
+      outerColors.reverse();
+    }
+
+    var colorStopsInRange = clipColorStops(colorStops, coordDim === 'x' ? api.getWidth() : api.getHeight());
+    var inRangeStopLen = colorStopsInRange.length;
+
+    if (!inRangeStopLen && stopLen) {
+      // All stops are out of range. All will be the same color.
+      return colorStops[0].coord < 0 ? outerColors[1] ? outerColors[1] : colorStops[stopLen - 1].color : outerColors[0] ? outerColors[0] : colorStops[0].color;
+    }
+
+    var tinyExtent = 10; // Arbitrary value: 10px
+
+    var minCoord = colorStopsInRange[0].coord - tinyExtent;
+    var maxCoord = colorStopsInRange[inRangeStopLen - 1].coord + tinyExtent;
+    var coordSpan = maxCoord - minCoord;
+
+    if (coordSpan < 1e-3) {
+      return 'transparent';
+    }
+
+    each(colorStopsInRange, function (stop) {
+      stop.offset = (stop.coord - minCoord) / coordSpan;
+    });
+    colorStopsInRange.push({
+      // NOTE: inRangeStopLen may still be 0 if stoplen is zero.
+      offset: inRangeStopLen ? colorStopsInRange[inRangeStopLen - 1].offset : 0.5,
+      color: outerColors[1] || 'transparent'
+    });
+    colorStopsInRange.unshift({
+      offset: inRangeStopLen ? colorStopsInRange[0].offset : 0.5,
+      color: outerColors[0] || 'transparent'
+    });
+    var gradient = new LinearGradient(0, 0, 0, 0, colorStopsInRange, true);
+    gradient[coordDim] = minCoord;
+    gradient[coordDim + '2'] = maxCoord;
+    return gradient;
+  }
+
+  function getIsIgnoreFunc(seriesModel, data, coordSys) {
+    var showAllSymbol = seriesModel.get('showAllSymbol');
+    var isAuto = showAllSymbol === 'auto';
+
+    if (showAllSymbol && !isAuto) {
+      return;
+    }
+
+    var categoryAxis = coordSys.getAxesByScale('ordinal')[0];
+
+    if (!categoryAxis) {
+      return;
+    } // Note that category label interval strategy might bring some weird effect
+    // in some scenario: users may wonder why some of the symbols are not
+    // displayed. So we show all symbols as possible as we can.
+
+
+    if (isAuto // Simplify the logic, do not determine label overlap here.
+    && canShowAllSymbolForCategory(categoryAxis, data)) {
+      return;
+    } // Otherwise follow the label interval strategy on category axis.
+
+
+    var categoryDataDim = data.mapDimension(categoryAxis.dim);
+    var labelMap = {};
+    each(categoryAxis.getViewLabels(), function (labelItem) {
+      var ordinalNumber = categoryAxis.scale.getRawOrdinalNumber(labelItem.tickValue);
+      labelMap[ordinalNumber] = 1;
+    });
+    return function (dataIndex) {
+      return !labelMap.hasOwnProperty(data.get(categoryDataDim, dataIndex));
+    };
+  }
+
+  function canShowAllSymbolForCategory(categoryAxis, data) {
+    // In most cases, line is monotonous on category axis, and the label size
+    // is close with each other. So we check the symbol size and some of the
+    // label size alone with the category axis to estimate whether all symbol
+    // can be shown without overlap.
+    var axisExtent = categoryAxis.getExtent();
+    var availSize = Math.abs(axisExtent[1] - axisExtent[0]) / categoryAxis.scale.count();
+    isNaN(availSize) && (availSize = 0); // 0/0 is NaN.
+    // Sampling some points, max 5.
+
+    var dataLen = data.count();
+    var step = Math.max(1, Math.round(dataLen / 5));
+
+    for (var dataIndex = 0; dataIndex < dataLen; dataIndex += step) {
+      if (Symbol$1.getSymbolSize(data, dataIndex // Only for cartesian, where `isHorizontal` exists.
+      )[categoryAxis.isHorizontal() ? 1 : 0] // Empirical number
+      * 1.5 > availSize) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function isPointNull(x, y) {
+    return isNaN(x) || isNaN(y);
+  }
+
+  function getLastIndexNotNull(points) {
+    var len = points.length / 2;
+
+    for (; len > 0; len--) {
+      if (!isPointNull(points[len * 2 - 2], points[len * 2 - 1])) {
+        break;
+      }
+    }
+
+    return len - 1;
+  }
+
+  function getPointAtIndex(points, idx) {
+    return [points[idx * 2], points[idx * 2 + 1]];
+  }
+
+  function getIndexRange(points, xOrY, dim) {
+    var len = points.length / 2;
+    var dimIdx = dim === 'x' ? 0 : 1;
+    var a;
+    var b;
+    var prevIndex = 0;
+    var nextIndex = -1;
+
+    for (var i = 0; i < len; i++) {
+      b = points[i * 2 + dimIdx];
+
+      if (isNaN(b) || isNaN(points[i * 2 + 1 - dimIdx])) {
+        continue;
+      }
+
+      if (i === 0) {
+        a = b;
+        continue;
+      }
+
+      if (a <= xOrY && b >= xOrY || a >= xOrY && b <= xOrY) {
+        nextIndex = i;
+        break;
+      }
+
+      prevIndex = i;
+      a = b;
+    }
+
+    return {
+      range: [prevIndex, nextIndex],
+      t: (xOrY - a) / (b - a)
+    };
+  }
+
+  function anyStateShowEndLabel(seriesModel) {
+    if (seriesModel.get(['endLabel', 'show'])) {
+      return true;
+    }
+
+    for (var i = 0; i < SPECIAL_STATES.length; i++) {
+      if (seriesModel.get([SPECIAL_STATES[i], 'endLabel', 'show'])) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function createLineClipPath(lineView, coordSys, hasAnimation, seriesModel) {
+    if (isCoordinateSystemType(coordSys, 'cartesian2d')) {
+      var endLabelModel_1 = seriesModel.getModel('endLabel');
+      var valueAnimation_1 = endLabelModel_1.get('valueAnimation');
+      var data_1 = seriesModel.getData();
+      var labelAnimationRecord_1 = {
+        lastFrameIndex: 0
+      };
+      var during = anyStateShowEndLabel(seriesModel) ? function (percent, clipRect) {
+        lineView._endLabelOnDuring(percent, clipRect, data_1, labelAnimationRecord_1, valueAnimation_1, endLabelModel_1, coordSys);
+      } : null;
+      var isHorizontal = coordSys.getBaseAxis().isHorizontal();
+      var clipPath = createGridClipPath(coordSys, hasAnimation, seriesModel, function () {
+        var endLabel = lineView._endLabel;
+
+        if (endLabel && hasAnimation) {
+          if (labelAnimationRecord_1.originalX != null) {
+            endLabel.attr({
+              x: labelAnimationRecord_1.originalX,
+              y: labelAnimationRecord_1.originalY
+            });
+          }
+        }
+      }, during); // Expand clip shape to avoid clipping when line value exceeds axis
+
+      if (!seriesModel.get('clip', true)) {
+        var rectShape = clipPath.shape;
+        var expandSize = Math.max(rectShape.width, rectShape.height);
+
+        if (isHorizontal) {
+          rectShape.y -= expandSize;
+          rectShape.height += expandSize * 2;
+        } else {
+          rectShape.x -= expandSize;
+          rectShape.width += expandSize * 2;
+        }
+      } // Set to the final frame. To make sure label layout is right.
+
+
+      if (during) {
+        during(1, clipPath);
+      }
+
+      return clipPath;
+    } else {
+      {
+        if (seriesModel.get(['endLabel', 'show'])) {
+          console.warn('endLabel is not supported for lines in polar systems.');
+        }
+      }
+      return createPolarClipPath(coordSys, hasAnimation, seriesModel);
+    }
+  }
+
+  function getEndLabelStateSpecified(endLabelModel, coordSys) {
+    var baseAxis = coordSys.getBaseAxis();
+    var isHorizontal = baseAxis.isHorizontal();
+    var isBaseInversed = baseAxis.inverse;
+    var align = isHorizontal ? isBaseInversed ? 'right' : 'left' : 'center';
+    var verticalAlign = isHorizontal ? 'middle' : isBaseInversed ? 'top' : 'bottom';
+    return {
+      normal: {
+        align: endLabelModel.get('align') || align,
+        verticalAlign: endLabelModel.get('verticalAlign') || verticalAlign
+      }
+    };
+  }
+
+  var LineView =
+  /** @class */
+  function (_super) {
+    __extends(LineView, _super);
+
+    function LineView() {
+      return _super !== null && _super.apply(this, arguments) || this;
+    }
+
+    LineView.prototype.init = function () {
+      var lineGroup = new Group();
+      var symbolDraw = new SymbolDraw();
+      this.group.add(symbolDraw.group);
+      this._symbolDraw = symbolDraw;
+      this._lineGroup = lineGroup;
+    };
+
+    LineView.prototype.render = function (seriesModel, ecModel, api) {
+      var _this = this;
+
+      var coordSys = seriesModel.coordinateSystem;
+      var group = this.group;
+      var data = seriesModel.getData();
+      var lineStyleModel = seriesModel.getModel('lineStyle');
+      var areaStyleModel = seriesModel.getModel('areaStyle');
+      var points = data.getLayout('points') || [];
+      var isCoordSysPolar = coordSys.type === 'polar';
+      var prevCoordSys = this._coordSys;
+      var symbolDraw = this._symbolDraw;
+      var polyline = this._polyline;
+      var polygon = this._polygon;
+      var lineGroup = this._lineGroup;
+      var hasAnimation = seriesModel.get('animation');
+      var isAreaChart = !areaStyleModel.isEmpty();
+      var valueOrigin = areaStyleModel.get('origin');
+      var dataCoordInfo = prepareDataCoordInfo(coordSys, data, valueOrigin);
+      var stackedOnPoints = isAreaChart && getStackedOnPoints(coordSys, data, dataCoordInfo);
+      var showSymbol = seriesModel.get('showSymbol');
+      var connectNulls = seriesModel.get('connectNulls');
+      var isIgnoreFunc = showSymbol && !isCoordSysPolar && getIsIgnoreFunc(seriesModel, data, coordSys); // Remove temporary symbols
+
+      var oldData = this._data;
+      oldData && oldData.eachItemGraphicEl(function (el, idx) {
+        if (el.__temp) {
+          group.remove(el);
+          oldData.setItemGraphicEl(idx, null);
+        }
+      }); // Remove previous created symbols if showSymbol changed to false
+
+      if (!showSymbol) {
+        symbolDraw.remove();
+      }
+
+      group.add(lineGroup); // FIXME step not support polar
+
+      var step = !isCoordSysPolar ? seriesModel.get('step') : false;
+      var clipShapeForSymbol;
+
+      if (coordSys && coordSys.getArea && seriesModel.get('clip', true)) {
+        clipShapeForSymbol = coordSys.getArea(); // Avoid float number rounding error for symbol on the edge of axis extent.
+        // See #7913 and `test/dataZoom-clip.html`.
+
+        if (clipShapeForSymbol.width != null) {
+          clipShapeForSymbol.x -= 0.1;
+          clipShapeForSymbol.y -= 0.1;
+          clipShapeForSymbol.width += 0.2;
+          clipShapeForSymbol.height += 0.2;
+        } else if (clipShapeForSymbol.r0) {
+          clipShapeForSymbol.r0 -= 0.5;
+          clipShapeForSymbol.r += 0.5;
+        }
+      }
+
+      this._clipShapeForSymbol = clipShapeForSymbol;
+      var visualColor = getVisualGradient(data, coordSys, api) || data.getVisual('style')[data.getVisual('drawType')]; // Initialization animation or coordinate system changed
+
+      if (!(polyline && prevCoordSys.type === coordSys.type && step === this._step)) {
+        showSymbol && symbolDraw.updateData(data, {
+          isIgnore: isIgnoreFunc,
+          clipShape: clipShapeForSymbol,
+          disableAnimation: true,
+          getSymbolPoint: function (idx) {
+            return [points[idx * 2], points[idx * 2 + 1]];
+          }
+        });
+        hasAnimation && this._initSymbolLabelAnimation(data, coordSys, clipShapeForSymbol);
+
+        if (step) {
+          // TODO If stacked series is not step
+          points = turnPointsIntoStep(points, coordSys, step, connectNulls);
+
+          if (stackedOnPoints) {
+            stackedOnPoints = turnPointsIntoStep(stackedOnPoints, coordSys, step, connectNulls);
+          }
+        }
+
+        polyline = this._newPolyline(points);
+
+        if (isAreaChart) {
+          polygon = this._newPolygon(points, stackedOnPoints);
+        } // If areaStyle is removed
+        else if (polygon) {
+            lineGroup.remove(polygon);
+            polygon = this._polygon = null;
+          } // NOTE: Must update _endLabel before setClipPath.
+
+
+        if (!isCoordSysPolar) {
+          this._initOrUpdateEndLabel(seriesModel, coordSys, convertToColorString(visualColor));
+        }
+
+        lineGroup.setClipPath(createLineClipPath(this, coordSys, true, seriesModel));
+      } else {
+        if (isAreaChart && !polygon) {
+          // If areaStyle is added
+          polygon = this._newPolygon(points, stackedOnPoints);
+        } else if (polygon && !isAreaChart) {
+          // If areaStyle is removed
+          lineGroup.remove(polygon);
+          polygon = this._polygon = null;
+        } // NOTE: Must update _endLabel before setClipPath.
+
+
+        if (!isCoordSysPolar) {
+          this._initOrUpdateEndLabel(seriesModel, coordSys, convertToColorString(visualColor));
+        } // Update clipPath
+
+
+        var oldClipPath = lineGroup.getClipPath();
+
+        if (oldClipPath) {
+          var newClipPath = createLineClipPath(this, coordSys, false, seriesModel);
+          initProps(oldClipPath, {
+            shape: newClipPath.shape
+          }, seriesModel);
+        } else {
+          lineGroup.setClipPath(createLineClipPath(this, coordSys, true, seriesModel));
+        } // Always update, or it is wrong in the case turning on legend
+        // because points are not changed.
+
+
+        showSymbol && symbolDraw.updateData(data, {
+          isIgnore: isIgnoreFunc,
+          clipShape: clipShapeForSymbol,
+          disableAnimation: true,
+          getSymbolPoint: function (idx) {
+            return [points[idx * 2], points[idx * 2 + 1]];
+          }
+        }); // In the case data zoom triggered refreshing frequently
+        // Data may not change if line has a category axis. So it should animate nothing.
+
+        if (!isPointsSame(this._stackedOnPoints, stackedOnPoints) || !isPointsSame(this._points, points)) {
+          if (hasAnimation) {
+            this._doUpdateAnimation(data, stackedOnPoints, coordSys, api, step, valueOrigin, connectNulls);
+          } else {
+            // Not do it in update with animation
+            if (step) {
+              // TODO If stacked series is not step
+              points = turnPointsIntoStep(points, coordSys, step, connectNulls);
+
+              if (stackedOnPoints) {
+                stackedOnPoints = turnPointsIntoStep(stackedOnPoints, coordSys, step, connectNulls);
+              }
+            }
+
+            polyline.setShape({
+              points: points
+            });
+            polygon && polygon.setShape({
+              points: points,
+              stackedOnPoints: stackedOnPoints
+            });
+          }
+        }
+      }
+
+      var emphasisModel = seriesModel.getModel('emphasis');
+      var focus = emphasisModel.get('focus');
+      var blurScope = emphasisModel.get('blurScope');
+      var emphasisDisabled = emphasisModel.get('disabled');
+      polyline.useStyle(defaults( // Use color in lineStyle first
+      lineStyleModel.getLineStyle(), {
+        fill: 'none',
+        stroke: visualColor,
+        lineJoin: 'bevel'
+      }));
+      setStatesStylesFromModel(polyline, seriesModel, 'lineStyle');
+
+      if (polyline.style.lineWidth > 0 && seriesModel.get(['emphasis', 'lineStyle', 'width']) === 'bolder') {
+        var emphasisLineStyle = polyline.getState('emphasis').style;
+        emphasisLineStyle.lineWidth = +polyline.style.lineWidth + 1;
+      } // Needs seriesIndex for focus
+
+
+      getECData(polyline).seriesIndex = seriesModel.seriesIndex;
+      toggleHoverEmphasis(polyline, focus, blurScope, emphasisDisabled);
+      var smooth = getSmooth(seriesModel.get('smooth'));
+      var smoothMonotone = seriesModel.get('smoothMonotone');
+      polyline.setShape({
+        smooth: smooth,
+        smoothMonotone: smoothMonotone,
+        connectNulls: connectNulls
+      });
+
+      if (polygon) {
+        var stackedOnSeries = data.getCalculationInfo('stackedOnSeries');
+        var stackedOnSmooth = 0;
+        polygon.useStyle(defaults(areaStyleModel.getAreaStyle(), {
+          fill: visualColor,
+          opacity: 0.7,
+          lineJoin: 'bevel',
+          decal: data.getVisual('style').decal
+        }));
+
+        if (stackedOnSeries) {
+          stackedOnSmooth = getSmooth(stackedOnSeries.get('smooth'));
+        }
+
+        polygon.setShape({
+          smooth: smooth,
+          stackedOnSmooth: stackedOnSmooth,
+          smoothMonotone: smoothMonotone,
+          connectNulls: connectNulls
+        });
+        setStatesStylesFromModel(polygon, seriesModel, 'areaStyle'); // Needs seriesIndex for focus
+
+        getECData(polygon).seriesIndex = seriesModel.seriesIndex;
+        toggleHoverEmphasis(polygon, focus, blurScope, emphasisDisabled);
+      }
+
+      var changePolyState = function (toState) {
+        _this._changePolyState(toState);
+      };
+
+      data.eachItemGraphicEl(function (el) {
+        // Switch polyline / polygon state if element changed its state.
+        el && (el.onHoverStateChange = changePolyState);
+      });
+      this._polyline.onHoverStateChange = changePolyState;
+      this._data = data; // Save the coordinate system for transition animation when data changed
+
+      this._coordSys = coordSys;
+      this._stackedOnPoints = stackedOnPoints;
+      this._points = points;
+      this._step = step;
+      this._valueOrigin = valueOrigin;
+
+      if (seriesModel.get('triggerLineEvent')) {
+        this.packEventData(seriesModel, polyline);
+        polygon && this.packEventData(seriesModel, polygon);
+      }
+    };
+
+    LineView.prototype.packEventData = function (seriesModel, el) {
+      getECData(el).eventData = {
+        componentType: 'series',
+        componentSubType: 'line',
+        componentIndex: seriesModel.componentIndex,
+        seriesIndex: seriesModel.seriesIndex,
+        seriesName: seriesModel.name,
+        seriesType: 'line'
+      };
+    };
+
+    LineView.prototype.highlight = function (seriesModel, ecModel, api, payload) {
+      var data = seriesModel.getData();
+      var dataIndex = queryDataIndex(data, payload);
+
+      this._changePolyState('emphasis');
+
+      if (!(dataIndex instanceof Array) && dataIndex != null && dataIndex >= 0) {
+        var points = data.getLayout('points');
+        var symbol = data.getItemGraphicEl(dataIndex);
+
+        if (!symbol) {
+          // Create a temporary symbol if it is not exists
+          var x = points[dataIndex * 2];
+          var y = points[dataIndex * 2 + 1];
+
+          if (isNaN(x) || isNaN(y)) {
+            // Null data
+            return;
+          } // fix #11360: shouldn't draw symbol outside clipShapeForSymbol
+
+
+          if (this._clipShapeForSymbol && !this._clipShapeForSymbol.contain(x, y)) {
+            return;
+          }
+
+          var zlevel = seriesModel.get('zlevel') || 0;
+          var z = seriesModel.get('z') || 0;
+          symbol = new Symbol$1(data, dataIndex);
+          symbol.x = x;
+          symbol.y = y;
+          symbol.setZ(zlevel, z); // ensure label text of the temporary symbol is in front of line and area polygon
+
+          var symbolLabel = symbol.getSymbolPath().getTextContent();
+
+          if (symbolLabel) {
+            symbolLabel.zlevel = zlevel;
+            symbolLabel.z = z;
+            symbolLabel.z2 = this._polyline.z2 + 1;
+          }
+
+          symbol.__temp = true;
+          data.setItemGraphicEl(dataIndex, symbol); // Stop scale animation
+
+          symbol.stopSymbolAnimation(true);
+          this.group.add(symbol);
+        }
+
+        symbol.highlight();
+      } else {
+        // Highlight whole series
+        ChartView.prototype.highlight.call(this, seriesModel, ecModel, api, payload);
+      }
+    };
+
+    LineView.prototype.downplay = function (seriesModel, ecModel, api, payload) {
+      var data = seriesModel.getData();
+      var dataIndex = queryDataIndex(data, payload);
+
+      this._changePolyState('normal');
+
+      if (dataIndex != null && dataIndex >= 0) {
+        var symbol = data.getItemGraphicEl(dataIndex);
+
+        if (symbol) {
+          if (symbol.__temp) {
+            data.setItemGraphicEl(dataIndex, null);
+            this.group.remove(symbol);
+          } else {
+            symbol.downplay();
+          }
+        }
+      } else {
+        // FIXME
+        // can not downplay completely.
+        // Downplay whole series
+        ChartView.prototype.downplay.call(this, seriesModel, ecModel, api, payload);
+      }
+    };
+
+    LineView.prototype._changePolyState = function (toState) {
+      var polygon = this._polygon;
+      setStatesFlag(this._polyline, toState);
+      polygon && setStatesFlag(polygon, toState);
+    };
+
+    LineView.prototype._newPolyline = function (points) {
+      var polyline = this._polyline; // Remove previous created polyline
+
+      if (polyline) {
+        this._lineGroup.remove(polyline);
+      }
+
+      polyline = new ECPolyline({
+        shape: {
+          points: points
+        },
+        segmentIgnoreThreshold: 2,
+        z2: 10
+      });
+
+      this._lineGroup.add(polyline);
+
+      this._polyline = polyline;
+      return polyline;
+    };
+
+    LineView.prototype._newPolygon = function (points, stackedOnPoints) {
+      var polygon = this._polygon; // Remove previous created polygon
+
+      if (polygon) {
+        this._lineGroup.remove(polygon);
+      }
+
+      polygon = new ECPolygon({
+        shape: {
+          points: points,
+          stackedOnPoints: stackedOnPoints
+        },
+        segmentIgnoreThreshold: 2
+      });
+
+      this._lineGroup.add(polygon);
+
+      this._polygon = polygon;
+      return polygon;
+    };
+
+    LineView.prototype._initSymbolLabelAnimation = function (data, coordSys, clipShape) {
+      var isHorizontalOrRadial;
+      var isCoordSysPolar;
+      var baseAxis = coordSys.getBaseAxis();
+      var isAxisInverse = baseAxis.inverse;
+
+      if (coordSys.type === 'cartesian2d') {
+        isHorizontalOrRadial = baseAxis.isHorizontal();
+        isCoordSysPolar = false;
+      } else if (coordSys.type === 'polar') {
+        isHorizontalOrRadial = baseAxis.dim === 'angle';
+        isCoordSysPolar = true;
+      }
+
+      var seriesModel = data.hostModel;
+      var seriesDuration = seriesModel.get('animationDuration');
+
+      if (isFunction(seriesDuration)) {
+        seriesDuration = seriesDuration(null);
+      }
+
+      var seriesDalay = seriesModel.get('animationDelay') || 0;
+      var seriesDalayValue = isFunction(seriesDalay) ? seriesDalay(null) : seriesDalay;
+      data.eachItemGraphicEl(function (symbol, idx) {
+        var el = symbol;
+
+        if (el) {
+          var point = [symbol.x, symbol.y];
+          var start = void 0;
+          var end = void 0;
+          var current = void 0;
+
+          if (clipShape) {
+            if (isCoordSysPolar) {
+              var polarClip = clipShape;
+              var coord = coordSys.pointToCoord(point);
+
+              if (isHorizontalOrRadial) {
+                start = polarClip.startAngle;
+                end = polarClip.endAngle;
+                current = -coord[1] / 180 * Math.PI;
+              } else {
+                start = polarClip.r0;
+                end = polarClip.r;
+                current = coord[0];
+              }
+            } else {
+              var gridClip = clipShape;
+
+              if (isHorizontalOrRadial) {
+                start = gridClip.x;
+                end = gridClip.x + gridClip.width;
+                current = symbol.x;
+              } else {
+                start = gridClip.y + gridClip.height;
+                end = gridClip.y;
+                current = symbol.y;
+              }
+            }
+          }
+
+          var ratio = end === start ? 0 : (current - start) / (end - start);
+
+          if (isAxisInverse) {
+            ratio = 1 - ratio;
+          }
+
+          var delay = isFunction(seriesDalay) ? seriesDalay(idx) : seriesDuration * ratio + seriesDalayValue;
+          var symbolPath = el.getSymbolPath();
+          var text = symbolPath.getTextContent();
+          el.attr({
+            scaleX: 0,
+            scaleY: 0
+          });
+          el.animateTo({
+            scaleX: 1,
+            scaleY: 1
+          }, {
+            duration: 200,
+            setToFinal: true,
+            delay: delay
+          });
+
+          if (text) {
+            text.animateFrom({
+              style: {
+                opacity: 0
+              }
+            }, {
+              duration: 300,
+              delay: delay
+            });
+          }
+
+          symbolPath.disableLabelAnimation = true;
+        }
+      });
+    };
+
+    LineView.prototype._initOrUpdateEndLabel = function (seriesModel, coordSys, inheritColor) {
+      var endLabelModel = seriesModel.getModel('endLabel');
+
+      if (anyStateShowEndLabel(seriesModel)) {
+        var data_2 = seriesModel.getData();
+        var polyline = this._polyline; // series may be filtered.
+
+        var points = data_2.getLayout('points');
+
+        if (!points) {
+          polyline.removeTextContent();
+          this._endLabel = null;
+          return;
+        }
+
+        var endLabel = this._endLabel;
+
+        if (!endLabel) {
+          endLabel = this._endLabel = new ZRText({
+            z2: 200 // should be higher than item symbol
+
+          });
+          endLabel.ignoreClip = true;
+          polyline.setTextContent(this._endLabel);
+          polyline.disableLabelAnimation = true;
+        } // Find last non-NaN data to display data
+
+
+        var dataIndex = getLastIndexNotNull(points);
+
+        if (dataIndex >= 0) {
+          setLabelStyle(polyline, getLabelStatesModels(seriesModel, 'endLabel'), {
+            inheritColor: inheritColor,
+            labelFetcher: seriesModel,
+            labelDataIndex: dataIndex,
+            defaultText: function (dataIndex, opt, interpolatedValue) {
+              return interpolatedValue != null ? getDefaultInterpolatedLabel(data_2, interpolatedValue) : getDefaultLabel(data_2, dataIndex);
+            },
+            enableTextSetter: true
+          }, getEndLabelStateSpecified(endLabelModel, coordSys));
+          polyline.textConfig.position = null;
+        }
+      } else if (this._endLabel) {
+        this._polyline.removeTextContent();
+
+        this._endLabel = null;
+      }
+    };
+
+    LineView.prototype._endLabelOnDuring = function (percent, clipRect, data, animationRecord, valueAnimation, endLabelModel, coordSys) {
+      var endLabel = this._endLabel;
+      var polyline = this._polyline;
+
+      if (endLabel) {
+        // NOTE: Don't remove percent < 1. percent === 1 means the first frame during render.
+        // The label is not prepared at this time.
+        if (percent < 1 && animationRecord.originalX == null) {
+          animationRecord.originalX = endLabel.x;
+          animationRecord.originalY = endLabel.y;
+        }
+
+        var points = data.getLayout('points');
+        var seriesModel = data.hostModel;
+        var connectNulls = seriesModel.get('connectNulls');
+        var precision = endLabelModel.get('precision');
+        var distance = endLabelModel.get('distance') || 0;
+        var baseAxis = coordSys.getBaseAxis();
+        var isHorizontal = baseAxis.isHorizontal();
+        var isBaseInversed = baseAxis.inverse;
+        var clipShape = clipRect.shape;
+        var xOrY = isBaseInversed ? isHorizontal ? clipShape.x : clipShape.y + clipShape.height : isHorizontal ? clipShape.x + clipShape.width : clipShape.y;
+        var distanceX = (isHorizontal ? distance : 0) * (isBaseInversed ? -1 : 1);
+        var distanceY = (isHorizontal ? 0 : -distance) * (isBaseInversed ? -1 : 1);
+        var dim = isHorizontal ? 'x' : 'y';
+        var dataIndexRange = getIndexRange(points, xOrY, dim);
+        var indices = dataIndexRange.range;
+        var diff = indices[1] - indices[0];
+        var value = void 0;
+
+        if (diff >= 1) {
+          // diff > 1 && connectNulls, which is on the null data.
+          if (diff > 1 && !connectNulls) {
+            var pt = getPointAtIndex(points, indices[0]);
+            endLabel.attr({
+              x: pt[0] + distanceX,
+              y: pt[1] + distanceY
+            });
+            valueAnimation && (value = seriesModel.getRawValue(indices[0]));
+          } else {
+            var pt = polyline.getPointOn(xOrY, dim);
+            pt && endLabel.attr({
+              x: pt[0] + distanceX,
+              y: pt[1] + distanceY
+            });
+            var startValue = seriesModel.getRawValue(indices[0]);
+            var endValue = seriesModel.getRawValue(indices[1]);
+            valueAnimation && (value = interpolateRawValues(data, precision, startValue, endValue, dataIndexRange.t));
+          }
+
+          animationRecord.lastFrameIndex = indices[0];
+        } else {
+          // If diff <= 0, which is the range is not found(Include NaN)
+          // Choose the first point or last point.
+          var idx = percent === 1 || animationRecord.lastFrameIndex > 0 ? indices[0] : 0;
+          var pt = getPointAtIndex(points, idx);
+          valueAnimation && (value = seriesModel.getRawValue(idx));
+          endLabel.attr({
+            x: pt[0] + distanceX,
+            y: pt[1] + distanceY
+          });
+        }
+
+        if (valueAnimation) {
+          labelInner(endLabel).setLabelText(value);
+        }
+      }
+    };
+    /**
+     * @private
+     */
+    // FIXME Two value axis
+
+
+    LineView.prototype._doUpdateAnimation = function (data, stackedOnPoints, coordSys, api, step, valueOrigin, connectNulls) {
+      var polyline = this._polyline;
+      var polygon = this._polygon;
+      var seriesModel = data.hostModel;
+      var diff = lineAnimationDiff(this._data, data, this._stackedOnPoints, stackedOnPoints, this._coordSys, coordSys, this._valueOrigin, valueOrigin);
+      var current = diff.current;
+      var stackedOnCurrent = diff.stackedOnCurrent;
+      var next = diff.next;
+      var stackedOnNext = diff.stackedOnNext;
+
+      if (step) {
+        // TODO If stacked series is not step
+        current = turnPointsIntoStep(diff.current, coordSys, step, connectNulls);
+        stackedOnCurrent = turnPointsIntoStep(diff.stackedOnCurrent, coordSys, step, connectNulls);
+        next = turnPointsIntoStep(diff.next, coordSys, step, connectNulls);
+        stackedOnNext = turnPointsIntoStep(diff.stackedOnNext, coordSys, step, connectNulls);
+      } // Don't apply animation if diff is large.
+      // For better result and avoid memory explosion problems like
+      // https://github.com/apache/incubator-echarts/issues/12229
+
+
+      if (getBoundingDiff(current, next) > 3000 || polygon && getBoundingDiff(stackedOnCurrent, stackedOnNext) > 3000) {
+        polyline.stopAnimation();
+        polyline.setShape({
+          points: next
+        });
+
+        if (polygon) {
+          polygon.stopAnimation();
+          polygon.setShape({
+            points: next,
+            stackedOnPoints: stackedOnNext
+          });
+        }
+
+        return;
+      }
+
+      polyline.shape.__points = diff.current;
+      polyline.shape.points = current;
+      var target = {
+        shape: {
+          points: next
+        }
+      }; // Also animate the original points.
+      // If points reference is changed when turning into step line.
+
+      if (diff.current !== current) {
+        target.shape.__points = diff.next;
+      } // Stop previous animation.
+
+
+      polyline.stopAnimation();
+      updateProps(polyline, target, seriesModel);
+
+      if (polygon) {
+        polygon.setShape({
+          // Reuse the points with polyline.
+          points: current,
+          stackedOnPoints: stackedOnCurrent
+        });
+        polygon.stopAnimation();
+        updateProps(polygon, {
+          shape: {
+            stackedOnPoints: stackedOnNext
+          }
+        }, seriesModel); // If use attr directly in updateProps.
+
+        if (polyline.shape.points !== polygon.shape.points) {
+          polygon.shape.points = polyline.shape.points;
+        }
+      }
+
+      var updatedDataInfo = [];
+      var diffStatus = diff.status;
+
+      for (var i = 0; i < diffStatus.length; i++) {
+        var cmd = diffStatus[i].cmd;
+
+        if (cmd === '=') {
+          var el = data.getItemGraphicEl(diffStatus[i].idx1);
+
+          if (el) {
+            updatedDataInfo.push({
+              el: el,
+              ptIdx: i // Index of points
+
+            });
+          }
+        }
+      }
+
+      if (polyline.animators && polyline.animators.length) {
+        polyline.animators[0].during(function () {
+          polygon && polygon.dirtyShape();
+          var points = polyline.shape.__points;
+
+          for (var i = 0; i < updatedDataInfo.length; i++) {
+            var el = updatedDataInfo[i].el;
+            var offset = updatedDataInfo[i].ptIdx * 2;
+            el.x = points[offset];
+            el.y = points[offset + 1];
+            el.markRedraw();
+          }
+        });
+      }
+    };
+
+    LineView.prototype.remove = function (ecModel) {
+      var group = this.group;
+      var oldData = this._data;
+
+      this._lineGroup.removeAll();
+
+      this._symbolDraw.remove(true); // Remove temporary created elements when highlighting
+
+
+      oldData && oldData.eachItemGraphicEl(function (el, idx) {
+        if (el.__temp) {
+          group.remove(el);
+          oldData.setItemGraphicEl(idx, null);
+        }
+      });
+      this._polyline = this._polygon = this._coordSys = this._points = this._stackedOnPoints = this._endLabel = this._data = null;
+    };
+
+    LineView.type = 'line';
+    return LineView;
+  }(ChartView);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function pointsLayout(seriesType, forceStoreInTypedArray) {
+    return {
+      seriesType: seriesType,
+      plan: createRenderPlanner(),
+      reset: function (seriesModel) {
+        var data = seriesModel.getData();
+        var coordSys = seriesModel.coordinateSystem;
+        var pipelineContext = seriesModel.pipelineContext;
+        var useTypedArray = forceStoreInTypedArray || pipelineContext.large;
+
+        if (!coordSys) {
+          return;
+        }
+
+        var dims = map(coordSys.dimensions, function (dim) {
+          return data.mapDimension(dim);
+        }).slice(0, 2);
+        var dimLen = dims.length;
+        var stackResultDim = data.getCalculationInfo('stackResultDimension');
+
+        if (isDimensionStacked(data, dims[0])) {
+          dims[0] = stackResultDim;
+        }
+
+        if (isDimensionStacked(data, dims[1])) {
+          dims[1] = stackResultDim;
+        }
+
+        var store = data.getStore();
+        var dimIdx0 = data.getDimensionIndex(dims[0]);
+        var dimIdx1 = data.getDimensionIndex(dims[1]);
+        return dimLen && {
+          progress: function (params, data) {
+            var segCount = params.end - params.start;
+            var points = useTypedArray && createFloat32Array(segCount * dimLen);
+            var tmpIn = [];
+            var tmpOut = [];
+
+            for (var i = params.start, offset = 0; i < params.end; i++) {
+              var point = void 0;
+
+              if (dimLen === 1) {
+                var x = store.get(dimIdx0, i); // NOTE: Make sure the second parameter is null to use default strategy.
+
+                point = coordSys.dataToPoint(x, null, tmpOut);
+              } else {
+                tmpIn[0] = store.get(dimIdx0, i);
+                tmpIn[1] = store.get(dimIdx1, i); // Let coordinate system to handle the NaN data.
+
+                point = coordSys.dataToPoint(tmpIn, null, tmpOut);
+              }
+
+              if (useTypedArray) {
+                points[offset++] = point[0];
+                points[offset++] = point[1];
+              } else {
+                data.setItemLayout(i, point.slice());
+              }
+            }
+
+            useTypedArray && data.setLayout('points', points);
+          }
+        };
+      }
+    };
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var samplers = {
+    average: function (frame) {
+      var sum = 0;
+      var count = 0;
+
+      for (var i = 0; i < frame.length; i++) {
+        if (!isNaN(frame[i])) {
+          sum += frame[i];
+          count++;
+        }
+      } // Return NaN if count is 0
+
+
+      return count === 0 ? NaN : sum / count;
+    },
+    sum: function (frame) {
+      var sum = 0;
+
+      for (var i = 0; i < frame.length; i++) {
+        // Ignore NaN
+        sum += frame[i] || 0;
+      }
+
+      return sum;
+    },
+    max: function (frame) {
+      var max = -Infinity;
+
+      for (var i = 0; i < frame.length; i++) {
+        frame[i] > max && (max = frame[i]);
+      } // NaN will cause illegal axis extent.
+
+
+      return isFinite(max) ? max : NaN;
+    },
+    min: function (frame) {
+      var min = Infinity;
+
+      for (var i = 0; i < frame.length; i++) {
+        frame[i] < min && (min = frame[i]);
+      } // NaN will cause illegal axis extent.
+
+
+      return isFinite(min) ? min : NaN;
+    },
+    // TODO
+    // Median
+    nearest: function (frame) {
+      return frame[0];
+    }
+  };
+
+  var indexSampler = function (frame) {
+    return Math.round(frame.length / 2);
+  };
+
+  function dataSample(seriesType) {
+    return {
+      seriesType: seriesType,
+      // FIXME:TS never used, so comment it
+      // modifyOutputEnd: true,
+      reset: function (seriesModel, ecModel, api) {
+        var data = seriesModel.getData();
+        var sampling = seriesModel.get('sampling');
+        var coordSys = seriesModel.coordinateSystem;
+        var count = data.count(); // Only cartesian2d support down sampling. Disable it when there is few data.
+
+        if (count > 10 && coordSys.type === 'cartesian2d' && sampling) {
+          var baseAxis = coordSys.getBaseAxis();
+          var valueAxis = coordSys.getOtherAxis(baseAxis);
+          var extent = baseAxis.getExtent();
+          var dpr = api.getDevicePixelRatio(); // Coordinste system has been resized
+
+          var size = Math.abs(extent[1] - extent[0]) * (dpr || 1);
+          var rate = Math.round(count / size);
+
+          if (isFinite(rate) && rate > 1) {
+            if (sampling === 'lttb') {
+              seriesModel.setData(data.lttbDownSample(data.mapDimension(valueAxis.dim), 1 / rate));
+            }
+
+            var sampler = void 0;
+
+            if (isString(sampling)) {
+              sampler = samplers[sampling];
+            } else if (isFunction(sampling)) {
+              sampler = sampling;
+            }
+
+            if (sampler) {
+              // Only support sample the first dim mapped from value axis.
+              seriesModel.setData(data.downSample(data.mapDimension(valueAxis.dim), 1 / rate, sampler, indexSampler));
+            }
+          }
+        }
+      }
+    };
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function install$2(registers) {
+    registers.registerChartView(LineView);
+    registers.registerSeriesModel(LineSeriesModel);
+    registers.registerLayout(pointsLayout('line', true));
+    registers.registerVisual({
+      seriesType: 'line',
+      reset: function (seriesModel) {
+        var data = seriesModel.getData(); // Visual coding for legend
+
+        var lineStyle = seriesModel.getModel('lineStyle').getLineStyle();
+
+        if (lineStyle && !lineStyle.stroke) {
+          // Fill in visual should be palette color if
+          // has color callback
+          lineStyle.stroke = data.getVisual('style').fill;
+        }
+
+        data.setVisual('legendLineStyle', lineStyle);
+      }
+    }); // Down sample after filter
+
+    registers.registerProcessor(registers.PRIORITY.PROCESSOR.STATISTIC, dataSample('line'));
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  use(install$2);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
   /* global Uint8ClampedArray */
 
   var GRADIENT_LEVELS = 256;
@@ -45156,52 +48660,6 @@
 
     return HeatmapLayer;
   }();
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  function isCoordinateSystemType(coordSys, type) {
-    return coordSys.type === type;
-  }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -45672,7 +49130,7 @@
   */
 
 
-  function install$2(registers) {
+  function install$3(registers) {
     registers.registerChartView(HeatmapView);
     registers.registerSeriesModel(HeatmapSeriesModel);
   }
@@ -45719,7 +49177,3317 @@
   */
 
 
-  use(install$2);
+  use(install$3);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var GridModel =
+  /** @class */
+  function (_super) {
+    __extends(GridModel, _super);
+
+    function GridModel() {
+      return _super !== null && _super.apply(this, arguments) || this;
+    }
+
+    GridModel.type = 'grid';
+    GridModel.dependencies = ['xAxis', 'yAxis'];
+    GridModel.layoutMode = 'box';
+    GridModel.defaultOption = {
+      show: false,
+      // zlevel: 0,
+      z: 0,
+      left: '10%',
+      top: 60,
+      right: '10%',
+      bottom: 70,
+      // If grid size contain label
+      containLabel: false,
+      // width: {totalWidth} - left - right,
+      // height: {totalHeight} - top - bottom,
+      backgroundColor: 'rgba(0,0,0,0)',
+      borderWidth: 1,
+      borderColor: '#ccc'
+    };
+    return GridModel;
+  }(ComponentModel);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var CartesianAxisModel =
+  /** @class */
+  function (_super) {
+    __extends(CartesianAxisModel, _super);
+
+    function CartesianAxisModel() {
+      return _super !== null && _super.apply(this, arguments) || this;
+    }
+
+    CartesianAxisModel.prototype.getCoordSysModel = function () {
+      return this.getReferringComponents('grid', SINGLE_REFERRING).models[0];
+    };
+
+    CartesianAxisModel.type = 'cartesian2dAxis';
+    return CartesianAxisModel;
+  }(ComponentModel);
+
+  mixin(CartesianAxisModel, AxisModelCommonMixin);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var defaultOption = {
+    show: true,
+    // zlevel: 0,
+    z: 0,
+    // Inverse the axis.
+    inverse: false,
+    // Axis name displayed.
+    name: '',
+    // 'start' | 'middle' | 'end'
+    nameLocation: 'end',
+    // By degree. By default auto rotate by nameLocation.
+    nameRotate: null,
+    nameTruncate: {
+      maxWidth: null,
+      ellipsis: '...',
+      placeholder: '.'
+    },
+    // Use global text style by default.
+    nameTextStyle: {},
+    // The gap between axisName and axisLine.
+    nameGap: 15,
+    // Default `false` to support tooltip.
+    silent: false,
+    // Default `false` to avoid legacy user event listener fail.
+    triggerEvent: false,
+    tooltip: {
+      show: false
+    },
+    axisPointer: {},
+    axisLine: {
+      show: true,
+      onZero: true,
+      onZeroAxisIndex: null,
+      lineStyle: {
+        color: '#6E7079',
+        width: 1,
+        type: 'solid'
+      },
+      // The arrow at both ends the the axis.
+      symbol: ['none', 'none'],
+      symbolSize: [10, 15]
+    },
+    axisTick: {
+      show: true,
+      // Whether axisTick is inside the grid or outside the grid.
+      inside: false,
+      // The length of axisTick.
+      length: 5,
+      lineStyle: {
+        width: 1
+      }
+    },
+    axisLabel: {
+      show: true,
+      // Whether axisLabel is inside the grid or outside the grid.
+      inside: false,
+      rotate: 0,
+      // true | false | null/undefined (auto)
+      showMinLabel: null,
+      // true | false | null/undefined (auto)
+      showMaxLabel: null,
+      margin: 8,
+      // formatter: null,
+      fontSize: 12
+    },
+    splitLine: {
+      show: true,
+      lineStyle: {
+        color: ['#E0E6F1'],
+        width: 1,
+        type: 'solid'
+      }
+    },
+    splitArea: {
+      show: false,
+      areaStyle: {
+        color: ['rgba(250,250,250,0.2)', 'rgba(210,219,238,0.2)']
+      }
+    }
+  };
+  var categoryAxis = merge({
+    // The gap at both ends of the axis. For categoryAxis, boolean.
+    boundaryGap: true,
+    // Set false to faster category collection.
+    deduplication: null,
+    // splitArea: {
+    // show: false
+    // },
+    splitLine: {
+      show: false
+    },
+    axisTick: {
+      // If tick is align with label when boundaryGap is true
+      alignWithLabel: false,
+      interval: 'auto'
+    },
+    axisLabel: {
+      interval: 'auto'
+    }
+  }, defaultOption);
+  var valueAxis = merge({
+    boundaryGap: [0, 0],
+    axisLine: {
+      // Not shown when other axis is categoryAxis in cartesian
+      show: 'auto'
+    },
+    axisTick: {
+      // Not shown when other axis is categoryAxis in cartesian
+      show: 'auto'
+    },
+    // TODO
+    // min/max: [30, datamin, 60] or [20, datamin] or [datamin, 60]
+    splitNumber: 5,
+    minorTick: {
+      // Minor tick, not available for cateogry axis.
+      show: false,
+      // Split number of minor ticks. The value should be in range of (0, 100)
+      splitNumber: 5,
+      // Length of minor tick
+      length: 3,
+      // Line style
+      lineStyle: {// Default to be same with axisTick
+      }
+    },
+    minorSplitLine: {
+      show: false,
+      lineStyle: {
+        color: '#F4F7FD',
+        width: 1
+      }
+    }
+  }, defaultOption);
+  var timeAxis = merge({
+    splitNumber: 6,
+    axisLabel: {
+      // To eliminate labels that are not nice
+      showMinLabel: false,
+      showMaxLabel: false,
+      rich: {
+        primary: {
+          fontWeight: 'bold'
+        }
+      }
+    },
+    splitLine: {
+      show: false
+    }
+  }, valueAxis);
+  var logAxis = defaults({
+    logBase: 10
+  }, valueAxis);
+  var axisDefault = {
+    category: categoryAxis,
+    value: valueAxis,
+    time: timeAxis,
+    log: logAxis
+  };
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var AXIS_TYPES = {
+    value: 1,
+    category: 1,
+    time: 1,
+    log: 1
+  };
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * Generate sub axis model class
+   * @param axisName 'x' 'y' 'radius' 'angle' 'parallel' ...
+   */
+
+  function axisModelCreator(registers, axisName, BaseAxisModelClass, extraDefaultOption) {
+    each(AXIS_TYPES, function (v, axisType) {
+      var defaultOption = merge(merge({}, axisDefault[axisType], true), extraDefaultOption, true);
+
+      var AxisModel =
+      /** @class */
+      function (_super) {
+        __extends(AxisModel, _super);
+
+        function AxisModel() {
+          var _this = _super !== null && _super.apply(this, arguments) || this;
+
+          _this.type = axisName + 'Axis.' + axisType;
+          return _this;
+        }
+
+        AxisModel.prototype.mergeDefaultAndTheme = function (option, ecModel) {
+          var layoutMode = fetchLayoutMode(this);
+          var inputPositionParams = layoutMode ? getLayoutParams(option) : {};
+          var themeModel = ecModel.getTheme();
+          merge(option, themeModel.get(axisType + 'Axis'));
+          merge(option, this.getDefaultOption());
+          option.type = getAxisType(option);
+
+          if (layoutMode) {
+            mergeLayoutParam(option, inputPositionParams, layoutMode);
+          }
+        };
+
+        AxisModel.prototype.optionUpdated = function () {
+          var thisOption = this.option;
+
+          if (thisOption.type === 'category') {
+            this.__ordinalMeta = OrdinalMeta.createByAxisModel(this);
+          }
+        };
+        /**
+         * Should not be called before all of 'getInitailData' finished.
+         * Because categories are collected during initializing data.
+         */
+
+
+        AxisModel.prototype.getCategories = function (rawData) {
+          var option = this.option; // FIXME
+          // warning if called before all of 'getInitailData' finished.
+
+          if (option.type === 'category') {
+            if (rawData) {
+              return option.data;
+            }
+
+            return this.__ordinalMeta.categories;
+          }
+        };
+
+        AxisModel.prototype.getOrdinalMeta = function () {
+          return this.__ordinalMeta;
+        };
+
+        AxisModel.type = axisName + 'Axis.' + axisType;
+        AxisModel.defaultOption = defaultOption;
+        return AxisModel;
+      }(BaseAxisModelClass);
+
+      registers.registerComponentModel(AxisModel);
+    });
+    registers.registerSubTypeDefaulter(axisName + 'Axis', getAxisType);
+  }
+
+  function getAxisType(option) {
+    // Default axis with data is category axis
+    return option.type || (option.data ? 'category' : 'value');
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var Cartesian =
+  /** @class */
+  function () {
+    function Cartesian(name) {
+      this.type = 'cartesian';
+      this._dimList = [];
+      this._axes = {};
+      this.name = name || '';
+    }
+
+    Cartesian.prototype.getAxis = function (dim) {
+      return this._axes[dim];
+    };
+
+    Cartesian.prototype.getAxes = function () {
+      return map(this._dimList, function (dim) {
+        return this._axes[dim];
+      }, this);
+    };
+
+    Cartesian.prototype.getAxesByScale = function (scaleType) {
+      scaleType = scaleType.toLowerCase();
+      return filter(this.getAxes(), function (axis) {
+        return axis.scale.type === scaleType;
+      });
+    };
+
+    Cartesian.prototype.addAxis = function (axis) {
+      var dim = axis.dim;
+      this._axes[dim] = axis;
+
+      this._dimList.push(dim);
+    };
+
+    return Cartesian;
+  }();
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var cartesian2DDimensions = ['x', 'y'];
+
+  function canCalculateAffineTransform(scale$$1) {
+    return scale$$1.type === 'interval' || scale$$1.type === 'time';
+  }
+
+  var Cartesian2D =
+  /** @class */
+  function (_super) {
+    __extends(Cartesian2D, _super);
+
+    function Cartesian2D() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = 'cartesian2d';
+      _this.dimensions = cartesian2DDimensions;
+      return _this;
+    }
+    /**
+     * Calculate an affine transform matrix if two axes are time or value.
+     * It's mainly for accelartion on the large time series data.
+     */
+
+
+    Cartesian2D.prototype.calcAffineTransform = function () {
+      this._transform = this._invTransform = null;
+      var xAxisScale = this.getAxis('x').scale;
+      var yAxisScale = this.getAxis('y').scale;
+
+      if (!canCalculateAffineTransform(xAxisScale) || !canCalculateAffineTransform(yAxisScale)) {
+        return;
+      }
+
+      var xScaleExtent = xAxisScale.getExtent();
+      var yScaleExtent = yAxisScale.getExtent();
+      var start = this.dataToPoint([xScaleExtent[0], yScaleExtent[0]]);
+      var end = this.dataToPoint([xScaleExtent[1], yScaleExtent[1]]);
+      var xScaleSpan = xScaleExtent[1] - xScaleExtent[0];
+      var yScaleSpan = yScaleExtent[1] - yScaleExtent[0];
+
+      if (!xScaleSpan || !yScaleSpan) {
+        return;
+      } // Accelerate data to point calculation on the special large time series data.
+
+
+      var scaleX = (end[0] - start[0]) / xScaleSpan;
+      var scaleY = (end[1] - start[1]) / yScaleSpan;
+      var translateX = start[0] - xScaleExtent[0] * scaleX;
+      var translateY = start[1] - yScaleExtent[0] * scaleY;
+      var m = this._transform = [scaleX, 0, 0, scaleY, translateX, translateY];
+      this._invTransform = invert([], m);
+    };
+    /**
+     * Base axis will be used on stacking.
+     */
+
+
+    Cartesian2D.prototype.getBaseAxis = function () {
+      return this.getAxesByScale('ordinal')[0] || this.getAxesByScale('time')[0] || this.getAxis('x');
+    };
+
+    Cartesian2D.prototype.containPoint = function (point) {
+      var axisX = this.getAxis('x');
+      var axisY = this.getAxis('y');
+      return axisX.contain(axisX.toLocalCoord(point[0])) && axisY.contain(axisY.toLocalCoord(point[1]));
+    };
+
+    Cartesian2D.prototype.containData = function (data) {
+      return this.getAxis('x').containData(data[0]) && this.getAxis('y').containData(data[1]);
+    };
+
+    Cartesian2D.prototype.containZone = function (data1, data2) {
+      var zoneDiag1 = this.dataToPoint(data1);
+      var zoneDiag2 = this.dataToPoint(data2);
+      var area = this.getArea();
+      var zone = new BoundingRect(zoneDiag1[0], zoneDiag1[1], zoneDiag2[0] - zoneDiag1[0], zoneDiag2[1] - zoneDiag1[1]);
+      return area.intersect(zone);
+    };
+
+    Cartesian2D.prototype.dataToPoint = function (data, clamp, out) {
+      out = out || [];
+      var xVal = data[0];
+      var yVal = data[1]; // Fast path
+
+      if (this._transform // It's supported that if data is like `[Inifity, 123]`, where only Y pixel calculated.
+      && xVal != null && isFinite(xVal) && yVal != null && isFinite(yVal)) {
+        return applyTransform(out, data, this._transform);
+      }
+
+      var xAxis = this.getAxis('x');
+      var yAxis = this.getAxis('y');
+      out[0] = xAxis.toGlobalCoord(xAxis.dataToCoord(xVal, clamp));
+      out[1] = yAxis.toGlobalCoord(yAxis.dataToCoord(yVal, clamp));
+      return out;
+    };
+
+    Cartesian2D.prototype.clampData = function (data, out) {
+      var xScale = this.getAxis('x').scale;
+      var yScale = this.getAxis('y').scale;
+      var xAxisExtent = xScale.getExtent();
+      var yAxisExtent = yScale.getExtent();
+      var x = xScale.parse(data[0]);
+      var y = yScale.parse(data[1]);
+      out = out || [];
+      out[0] = Math.min(Math.max(Math.min(xAxisExtent[0], xAxisExtent[1]), x), Math.max(xAxisExtent[0], xAxisExtent[1]));
+      out[1] = Math.min(Math.max(Math.min(yAxisExtent[0], yAxisExtent[1]), y), Math.max(yAxisExtent[0], yAxisExtent[1]));
+      return out;
+    };
+
+    Cartesian2D.prototype.pointToData = function (point, clamp) {
+      var out = [];
+
+      if (this._invTransform) {
+        return applyTransform(out, point, this._invTransform);
+      }
+
+      var xAxis = this.getAxis('x');
+      var yAxis = this.getAxis('y');
+      out[0] = xAxis.coordToData(xAxis.toLocalCoord(point[0]), clamp);
+      out[1] = yAxis.coordToData(yAxis.toLocalCoord(point[1]), clamp);
+      return out;
+    };
+
+    Cartesian2D.prototype.getOtherAxis = function (axis) {
+      return this.getAxis(axis.dim === 'x' ? 'y' : 'x');
+    };
+    /**
+     * Get rect area of cartesian.
+     * Area will have a contain function to determine if a point is in the coordinate system.
+     */
+
+
+    Cartesian2D.prototype.getArea = function () {
+      var xExtent = this.getAxis('x').getGlobalExtent();
+      var yExtent = this.getAxis('y').getGlobalExtent();
+      var x = Math.min(xExtent[0], xExtent[1]);
+      var y = Math.min(yExtent[0], yExtent[1]);
+      var width = Math.max(xExtent[0], xExtent[1]) - x;
+      var height = Math.max(yExtent[0], yExtent[1]) - y;
+      return new BoundingRect(x, y, width, height);
+    };
+
+    return Cartesian2D;
+  }(Cartesian);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var Axis2D =
+  /** @class */
+  function (_super) {
+    __extends(Axis2D, _super);
+
+    function Axis2D(dim, scale, coordExtent, axisType, position) {
+      var _this = _super.call(this, dim, scale, coordExtent) || this;
+      /**
+       * Index of axis, can be used as key
+       * Injected outside.
+       */
+
+
+      _this.index = 0;
+      _this.type = axisType || 'value';
+      _this.position = position || 'bottom';
+      return _this;
+    }
+
+    Axis2D.prototype.isHorizontal = function () {
+      var position = this.position;
+      return position === 'top' || position === 'bottom';
+    };
+    /**
+     * Each item cooresponds to this.getExtent(), which
+     * means globalExtent[0] may greater than globalExtent[1],
+     * unless `asc` is input.
+     *
+     * @param {boolean} [asc]
+     * @return {Array.<number>}
+     */
+
+
+    Axis2D.prototype.getGlobalExtent = function (asc) {
+      var ret = this.getExtent();
+      ret[0] = this.toGlobalCoord(ret[0]);
+      ret[1] = this.toGlobalCoord(ret[1]);
+      asc && ret[0] > ret[1] && ret.reverse();
+      return ret;
+    };
+
+    Axis2D.prototype.pointToData = function (point, clamp) {
+      return this.coordToData(this.toLocalCoord(point[this.dim === 'x' ? 0 : 1]), clamp);
+    };
+    /**
+     * Set ordinalSortInfo
+     * @param info new OrdinalSortInfo
+     */
+
+
+    Axis2D.prototype.setCategorySortInfo = function (info) {
+      if (this.type !== 'category') {
+        return false;
+      }
+
+      this.model.option.categorySortInfo = info;
+      this.scale.setSortInfo(info);
+    };
+
+    return Axis2D;
+  }(Axis);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * Can only be called after coordinate system creation stage.
+   * (Can be called before coordinate system update stage).
+   */
+
+
+  function layout$1(gridModel, axisModel, opt) {
+    opt = opt || {};
+    var grid = gridModel.coordinateSystem;
+    var axis = axisModel.axis;
+    var layout = {};
+    var otherAxisOnZeroOf = axis.getAxesOnZeroOf()[0];
+    var rawAxisPosition = axis.position;
+    var axisPosition = otherAxisOnZeroOf ? 'onZero' : rawAxisPosition;
+    var axisDim = axis.dim;
+    var rect = grid.getRect();
+    var rectBound = [rect.x, rect.x + rect.width, rect.y, rect.y + rect.height];
+    var idx = {
+      left: 0,
+      right: 1,
+      top: 0,
+      bottom: 1,
+      onZero: 2
+    };
+    var axisOffset = axisModel.get('offset') || 0;
+    var posBound = axisDim === 'x' ? [rectBound[2] - axisOffset, rectBound[3] + axisOffset] : [rectBound[0] - axisOffset, rectBound[1] + axisOffset];
+
+    if (otherAxisOnZeroOf) {
+      var onZeroCoord = otherAxisOnZeroOf.toGlobalCoord(otherAxisOnZeroOf.dataToCoord(0));
+      posBound[idx.onZero] = Math.max(Math.min(onZeroCoord, posBound[1]), posBound[0]);
+    } // Axis position
+
+
+    layout.position = [axisDim === 'y' ? posBound[idx[axisPosition]] : rectBound[0], axisDim === 'x' ? posBound[idx[axisPosition]] : rectBound[3]]; // Axis rotation
+
+    layout.rotation = Math.PI / 2 * (axisDim === 'x' ? 0 : 1); // Tick and label direction, x y is axisDim
+
+    var dirMap = {
+      top: -1,
+      bottom: 1,
+      left: -1,
+      right: 1
+    };
+    layout.labelDirection = layout.tickDirection = layout.nameDirection = dirMap[rawAxisPosition];
+    layout.labelOffset = otherAxisOnZeroOf ? posBound[idx[rawAxisPosition]] - posBound[idx.onZero] : 0;
+
+    if (axisModel.get(['axisTick', 'inside'])) {
+      layout.tickDirection = -layout.tickDirection;
+    }
+
+    if (retrieve(opt.labelInside, axisModel.get(['axisLabel', 'inside']))) {
+      layout.labelDirection = -layout.labelDirection;
+    } // Special label rotation
+
+
+    var labelRotate = axisModel.get(['axisLabel', 'rotate']);
+    layout.labelRotate = axisPosition === 'top' ? -labelRotate : labelRotate; // Over splitLine and splitArea
+
+    layout.z2 = 1;
+    return layout;
+  }
+
+  function isCartesian2DSeries(seriesModel) {
+    return seriesModel.get('coordinateSystem') === 'cartesian2d';
+  }
+
+  function findAxisModels(seriesModel) {
+    var axisModelMap = {
+      xAxisModel: null,
+      yAxisModel: null
+    };
+    each(axisModelMap, function (v, key) {
+      var axisType = key.replace(/Model$/, '');
+      var axisModel = seriesModel.getReferringComponents(axisType, SINGLE_REFERRING).models[0];
+      {
+        if (!axisModel) {
+          throw new Error(axisType + ' "' + retrieve3(seriesModel.get(axisType + 'Index'), seriesModel.get(axisType + 'Id'), 0) + '" not found');
+        }
+      }
+      axisModelMap[key] = axisModel;
+    });
+    return axisModelMap;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var mathLog$1 = Math.log;
+
+  function alignScaleTicks(scale, axisModel, alignToScale) {
+    var intervalScaleProto = IntervalScale.prototype; // NOTE: There is a precondition for log scale  here:
+    // In log scale we store _interval and _extent of exponent value.
+    // So if we use the method of InternalScale to set/get these data.
+    // It process the exponent value, which is linear and what we want here.
+
+    var alignToTicks = intervalScaleProto.getTicks.call(alignToScale);
+    var alignToNicedTicks = intervalScaleProto.getTicks.call(alignToScale, true);
+    var alignToSplitNumber = alignToTicks.length - 1;
+    var alignToInterval = intervalScaleProto.getInterval.call(alignToScale);
+    var scaleExtent = getScaleExtent(scale, axisModel);
+    var rawExtent = scaleExtent.extent;
+    var isMinFixed = scaleExtent.fixMin;
+    var isMaxFixed = scaleExtent.fixMax;
+
+    if (scale.type === 'log') {
+      var logBase = mathLog$1(scale.base);
+      rawExtent = [mathLog$1(rawExtent[0]) / logBase, mathLog$1(rawExtent[1]) / logBase];
+    }
+
+    scale.setExtent(rawExtent[0], rawExtent[1]);
+    scale.calcNiceExtent({
+      splitNumber: alignToSplitNumber,
+      fixMin: isMinFixed,
+      fixMax: isMaxFixed
+    });
+    var extent = intervalScaleProto.getExtent.call(scale); // Need to update the rawExtent.
+    // Because value in rawExtent may be not parsed. e.g. 'dataMin', 'dataMax'
+
+    if (isMinFixed) {
+      rawExtent[0] = extent[0];
+    }
+
+    if (isMaxFixed) {
+      rawExtent[1] = extent[1];
+    }
+
+    var interval = intervalScaleProto.getInterval.call(scale);
+    var min = rawExtent[0];
+    var max = rawExtent[1];
+
+    if (isMinFixed && isMaxFixed) {
+      // User set min, max, divide to get new interval
+      interval = (max - min) / alignToSplitNumber;
+    } else if (isMinFixed) {
+      max = rawExtent[0] + interval * alignToSplitNumber; // User set min, expand extent on the other side
+
+      while (max < rawExtent[1] && isFinite(max) && isFinite(rawExtent[1])) {
+        interval = increaseInterval(interval);
+        max = rawExtent[0] + interval * alignToSplitNumber;
+      }
+    } else if (isMaxFixed) {
+      // User set max, expand extent on the other side
+      min = rawExtent[1] - interval * alignToSplitNumber;
+
+      while (min > rawExtent[0] && isFinite(min) && isFinite(rawExtent[0])) {
+        interval = increaseInterval(interval);
+        min = rawExtent[1] - interval * alignToSplitNumber;
+      }
+    } else {
+      var nicedSplitNumber = scale.getTicks().length - 1;
+
+      if (nicedSplitNumber > alignToSplitNumber) {
+        interval = increaseInterval(interval);
+      }
+
+      var range = interval * alignToSplitNumber;
+      max = Math.ceil(rawExtent[1] / interval) * interval;
+      min = round(max - range); // Not change the result that crossing zero.
+
+      if (min < 0 && rawExtent[0] >= 0) {
+        min = 0;
+        max = round(range);
+      } else if (max > 0 && rawExtent[1] <= 0) {
+        max = 0;
+        min = -round(range);
+      }
+    } // Adjust min, max based on the extent of alignTo. When min or max is set in alignTo scale
+
+
+    var t0 = (alignToTicks[0].value - alignToNicedTicks[0].value) / alignToInterval;
+    var t1 = (alignToTicks[alignToSplitNumber].value - alignToNicedTicks[alignToSplitNumber].value) / alignToInterval; // NOTE: Must in setExtent -> setInterval -> setNiceExtent order.
+
+    intervalScaleProto.setExtent.call(scale, min + interval * t0, max + interval * t1);
+    intervalScaleProto.setInterval.call(scale, interval);
+
+    if (t0 || t1) {
+      intervalScaleProto.setNiceExtent.call(scale, min + interval, max - interval);
+    }
+
+    {
+      var ticks = intervalScaleProto.getTicks.call(scale);
+
+      if (ticks[1] && (!isValueNice(interval) || getPrecisionSafe(ticks[1].value) > getPrecisionSafe(interval))) {
+        warn( // eslint-disable-next-line
+        "The ticks may be not readable when set min: " + axisModel.get('min') + ", max: " + axisModel.get('max') + " and alignTicks: true");
+      }
+    }
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * Grid is a region which contains at most 4 cartesian systems
+   *
+   * TODO Default cartesian
+   */
+
+
+  var Grid =
+  /** @class */
+  function () {
+    function Grid(gridModel, ecModel, api) {
+      // FIXME:TS where used (different from registered type 'cartesian2d')?
+      this.type = 'grid';
+      this._coordsMap = {};
+      this._coordsList = [];
+      this._axesMap = {};
+      this._axesList = [];
+      this.axisPointerEnabled = true;
+      this.dimensions = cartesian2DDimensions;
+
+      this._initCartesian(gridModel, ecModel, api);
+
+      this.model = gridModel;
+    }
+
+    Grid.prototype.getRect = function () {
+      return this._rect;
+    };
+
+    Grid.prototype.update = function (ecModel, api) {
+      var axesMap = this._axesMap;
+
+      this._updateScale(ecModel, this.model);
+
+      function updateAxisTicks(axes) {
+        var alignTo; // Axis is added in order of axisIndex.
+
+        var axesIndices = keys(axes);
+        var len = axesIndices.length;
+
+        if (!len) {
+          return;
+        }
+
+        var axisNeedsAlign = []; // Process once and calculate the ticks for those don't use alignTicks.
+
+        for (var i = len - 1; i >= 0; i--) {
+          var idx = +axesIndices[i]; // Convert to number.
+
+          var axis = axes[idx];
+          var model = axis.model;
+          var scale = axis.scale;
+
+          if ( // Only value and log axis without interval support alignTicks.
+          isIntervalOrLogScale(scale) && model.get('alignTicks') && model.get('interval') == null) {
+            axisNeedsAlign.push(axis);
+          } else {
+            niceScaleExtent(scale, model);
+
+            if (isIntervalOrLogScale(scale)) {
+              // Can only align to interval or log axis.
+              alignTo = axis;
+            }
+          }
+        } // All axes has set alignTicks. Pick the first one.
+        // PENDING. Should we find the axis that both set interval, min, max and align to this one?
+
+
+        if (axisNeedsAlign.length) {
+          if (!alignTo) {
+            alignTo = axisNeedsAlign.pop();
+            niceScaleExtent(alignTo.scale, alignTo.model);
+          }
+
+          each(axisNeedsAlign, function (axis) {
+            alignScaleTicks(axis.scale, axis.model, alignTo.scale);
+          });
+        }
+      }
+
+      updateAxisTicks(axesMap.x);
+      updateAxisTicks(axesMap.y); // Key: axisDim_axisIndex, value: boolean, whether onZero target.
+
+      var onZeroRecords = {};
+      each(axesMap.x, function (xAxis) {
+        fixAxisOnZero(axesMap, 'y', xAxis, onZeroRecords);
+      });
+      each(axesMap.y, function (yAxis) {
+        fixAxisOnZero(axesMap, 'x', yAxis, onZeroRecords);
+      }); // Resize again if containLabel is enabled
+      // FIXME It may cause getting wrong grid size in data processing stage
+
+      this.resize(this.model, api);
+    };
+    /**
+     * Resize the grid
+     */
+
+
+    Grid.prototype.resize = function (gridModel, api, ignoreContainLabel) {
+      var boxLayoutParams = gridModel.getBoxLayoutParams();
+      var isContainLabel = !ignoreContainLabel && gridModel.get('containLabel');
+      var gridRect = getLayoutRect(boxLayoutParams, {
+        width: api.getWidth(),
+        height: api.getHeight()
+      });
+      this._rect = gridRect;
+      var axesList = this._axesList;
+      adjustAxes(); // Minus label size
+
+      if (isContainLabel) {
+        each(axesList, function (axis) {
+          if (!axis.model.get(['axisLabel', 'inside'])) {
+            var labelUnionRect = estimateLabelUnionRect(axis);
+
+            if (labelUnionRect) {
+              var dim = axis.isHorizontal() ? 'height' : 'width';
+              var margin = axis.model.get(['axisLabel', 'margin']);
+              gridRect[dim] -= labelUnionRect[dim] + margin;
+
+              if (axis.position === 'top') {
+                gridRect.y += labelUnionRect.height + margin;
+              } else if (axis.position === 'left') {
+                gridRect.x += labelUnionRect.width + margin;
+              }
+            }
+          }
+        });
+        adjustAxes();
+      }
+
+      each(this._coordsList, function (coord) {
+        // Calculate affine matrix to accelerate the data to point transform.
+        // If all the axes scales are time or value.
+        coord.calcAffineTransform();
+      });
+
+      function adjustAxes() {
+        each(axesList, function (axis) {
+          var isHorizontal = axis.isHorizontal();
+          var extent = isHorizontal ? [0, gridRect.width] : [0, gridRect.height];
+          var idx = axis.inverse ? 1 : 0;
+          axis.setExtent(extent[idx], extent[1 - idx]);
+          updateAxisTransform(axis, isHorizontal ? gridRect.x : gridRect.y);
+        });
+      }
+    };
+
+    Grid.prototype.getAxis = function (dim, axisIndex) {
+      var axesMapOnDim = this._axesMap[dim];
+
+      if (axesMapOnDim != null) {
+        return axesMapOnDim[axisIndex || 0];
+      }
+    };
+
+    Grid.prototype.getAxes = function () {
+      return this._axesList.slice();
+    };
+
+    Grid.prototype.getCartesian = function (xAxisIndex, yAxisIndex) {
+      if (xAxisIndex != null && yAxisIndex != null) {
+        var key = 'x' + xAxisIndex + 'y' + yAxisIndex;
+        return this._coordsMap[key];
+      }
+
+      if (isObject(xAxisIndex)) {
+        yAxisIndex = xAxisIndex.yAxisIndex;
+        xAxisIndex = xAxisIndex.xAxisIndex;
+      }
+
+      for (var i = 0, coordList = this._coordsList; i < coordList.length; i++) {
+        if (coordList[i].getAxis('x').index === xAxisIndex || coordList[i].getAxis('y').index === yAxisIndex) {
+          return coordList[i];
+        }
+      }
+    };
+
+    Grid.prototype.getCartesians = function () {
+      return this._coordsList.slice();
+    };
+    /**
+     * @implements
+     */
+
+
+    Grid.prototype.convertToPixel = function (ecModel, finder, value) {
+      var target = this._findConvertTarget(finder);
+
+      return target.cartesian ? target.cartesian.dataToPoint(value) : target.axis ? target.axis.toGlobalCoord(target.axis.dataToCoord(value)) : null;
+    };
+    /**
+     * @implements
+     */
+
+
+    Grid.prototype.convertFromPixel = function (ecModel, finder, value) {
+      var target = this._findConvertTarget(finder);
+
+      return target.cartesian ? target.cartesian.pointToData(value) : target.axis ? target.axis.coordToData(target.axis.toLocalCoord(value)) : null;
+    };
+
+    Grid.prototype._findConvertTarget = function (finder) {
+      var seriesModel = finder.seriesModel;
+      var xAxisModel = finder.xAxisModel || seriesModel && seriesModel.getReferringComponents('xAxis', SINGLE_REFERRING).models[0];
+      var yAxisModel = finder.yAxisModel || seriesModel && seriesModel.getReferringComponents('yAxis', SINGLE_REFERRING).models[0];
+      var gridModel = finder.gridModel;
+      var coordsList = this._coordsList;
+      var cartesian;
+      var axis;
+
+      if (seriesModel) {
+        cartesian = seriesModel.coordinateSystem;
+        indexOf(coordsList, cartesian) < 0 && (cartesian = null);
+      } else if (xAxisModel && yAxisModel) {
+        cartesian = this.getCartesian(xAxisModel.componentIndex, yAxisModel.componentIndex);
+      } else if (xAxisModel) {
+        axis = this.getAxis('x', xAxisModel.componentIndex);
+      } else if (yAxisModel) {
+        axis = this.getAxis('y', yAxisModel.componentIndex);
+      } // Lowest priority.
+      else if (gridModel) {
+          var grid = gridModel.coordinateSystem;
+
+          if (grid === this) {
+            cartesian = this._coordsList[0];
+          }
+        }
+
+      return {
+        cartesian: cartesian,
+        axis: axis
+      };
+    };
+    /**
+     * @implements
+     */
+
+
+    Grid.prototype.containPoint = function (point) {
+      var coord = this._coordsList[0];
+
+      if (coord) {
+        return coord.containPoint(point);
+      }
+    };
+    /**
+     * Initialize cartesian coordinate systems
+     */
+
+
+    Grid.prototype._initCartesian = function (gridModel, ecModel, api) {
+      var _this = this;
+
+      var grid = this;
+      var axisPositionUsed = {
+        left: false,
+        right: false,
+        top: false,
+        bottom: false
+      };
+      var axesMap = {
+        x: {},
+        y: {}
+      };
+      var axesCount = {
+        x: 0,
+        y: 0
+      }; // Create axis
+
+      ecModel.eachComponent('xAxis', createAxisCreator('x'), this);
+      ecModel.eachComponent('yAxis', createAxisCreator('y'), this);
+
+      if (!axesCount.x || !axesCount.y) {
+        // Roll back when there no either x or y axis
+        this._axesMap = {};
+        this._axesList = [];
+        return;
+      }
+
+      this._axesMap = axesMap; // Create cartesian2d
+
+      each(axesMap.x, function (xAxis, xAxisIndex) {
+        each(axesMap.y, function (yAxis, yAxisIndex) {
+          var key = 'x' + xAxisIndex + 'y' + yAxisIndex;
+          var cartesian = new Cartesian2D(key);
+          cartesian.master = _this;
+          cartesian.model = gridModel;
+          _this._coordsMap[key] = cartesian;
+
+          _this._coordsList.push(cartesian);
+
+          cartesian.addAxis(xAxis);
+          cartesian.addAxis(yAxis);
+        });
+      });
+
+      function createAxisCreator(dimName) {
+        return function (axisModel, idx) {
+          if (!isAxisUsedInTheGrid(axisModel, gridModel)) {
+            return;
+          }
+
+          var axisPosition = axisModel.get('position');
+
+          if (dimName === 'x') {
+            // Fix position
+            if (axisPosition !== 'top' && axisPosition !== 'bottom') {
+              // Default bottom of X
+              axisPosition = axisPositionUsed.bottom ? 'top' : 'bottom';
+            }
+          } else {
+            // Fix position
+            if (axisPosition !== 'left' && axisPosition !== 'right') {
+              // Default left of Y
+              axisPosition = axisPositionUsed.left ? 'right' : 'left';
+            }
+          }
+
+          axisPositionUsed[axisPosition] = true;
+          var axis = new Axis2D(dimName, createScaleByModel(axisModel), [0, 0], axisModel.get('type'), axisPosition);
+          var isCategory = axis.type === 'category';
+          axis.onBand = isCategory && axisModel.get('boundaryGap');
+          axis.inverse = axisModel.get('inverse'); // Inject axis into axisModel
+
+          axisModel.axis = axis; // Inject axisModel into axis
+
+          axis.model = axisModel; // Inject grid info axis
+
+          axis.grid = grid; // Index of axis, can be used as key
+
+          axis.index = idx;
+
+          grid._axesList.push(axis);
+
+          axesMap[dimName][idx] = axis;
+          axesCount[dimName]++;
+        };
+      }
+    };
+    /**
+     * Update cartesian properties from series.
+     */
+
+
+    Grid.prototype._updateScale = function (ecModel, gridModel) {
+      // Reset scale
+      each(this._axesList, function (axis) {
+        axis.scale.setExtent(Infinity, -Infinity);
+
+        if (axis.type === 'category') {
+          var categorySortInfo = axis.model.get('categorySortInfo');
+          axis.scale.setSortInfo(categorySortInfo);
+        }
+      });
+      ecModel.eachSeries(function (seriesModel) {
+        if (isCartesian2DSeries(seriesModel)) {
+          var axesModelMap = findAxisModels(seriesModel);
+          var xAxisModel = axesModelMap.xAxisModel;
+          var yAxisModel = axesModelMap.yAxisModel;
+
+          if (!isAxisUsedInTheGrid(xAxisModel, gridModel) || !isAxisUsedInTheGrid(yAxisModel, gridModel)) {
+            return;
+          }
+
+          var cartesian = this.getCartesian(xAxisModel.componentIndex, yAxisModel.componentIndex);
+          var data = seriesModel.getData();
+          var xAxis = cartesian.getAxis('x');
+          var yAxis = cartesian.getAxis('y');
+          unionExtent(data, xAxis);
+          unionExtent(data, yAxis);
+        }
+      }, this);
+
+      function unionExtent(data, axis) {
+        each(getDataDimensionsOnAxis(data, axis.dim), function (dim) {
+          axis.scale.unionExtentFromData(data, dim);
+        });
+      }
+    };
+    /**
+     * @param dim 'x' or 'y' or 'auto' or null/undefined
+     */
+
+
+    Grid.prototype.getTooltipAxes = function (dim) {
+      var baseAxes = [];
+      var otherAxes = [];
+      each(this.getCartesians(), function (cartesian) {
+        var baseAxis = dim != null && dim !== 'auto' ? cartesian.getAxis(dim) : cartesian.getBaseAxis();
+        var otherAxis = cartesian.getOtherAxis(baseAxis);
+        indexOf(baseAxes, baseAxis) < 0 && baseAxes.push(baseAxis);
+        indexOf(otherAxes, otherAxis) < 0 && otherAxes.push(otherAxis);
+      });
+      return {
+        baseAxes: baseAxes,
+        otherAxes: otherAxes
+      };
+    };
+
+    Grid.create = function (ecModel, api) {
+      var grids = [];
+      ecModel.eachComponent('grid', function (gridModel, idx) {
+        var grid = new Grid(gridModel, ecModel, api);
+        grid.name = 'grid_' + idx; // dataSampling requires axis extent, so resize
+        // should be performed in create stage.
+
+        grid.resize(gridModel, api, true);
+        gridModel.coordinateSystem = grid;
+        grids.push(grid);
+      }); // Inject the coordinateSystems into seriesModel
+
+      ecModel.eachSeries(function (seriesModel) {
+        if (!isCartesian2DSeries(seriesModel)) {
+          return;
+        }
+
+        var axesModelMap = findAxisModels(seriesModel);
+        var xAxisModel = axesModelMap.xAxisModel;
+        var yAxisModel = axesModelMap.yAxisModel;
+        var gridModel = xAxisModel.getCoordSysModel();
+        {
+          if (!gridModel) {
+            throw new Error('Grid "' + retrieve3(xAxisModel.get('gridIndex'), xAxisModel.get('gridId'), 0) + '" not found');
+          }
+
+          if (xAxisModel.getCoordSysModel() !== yAxisModel.getCoordSysModel()) {
+            throw new Error('xAxis and yAxis must use the same grid');
+          }
+        }
+        var grid = gridModel.coordinateSystem;
+        seriesModel.coordinateSystem = grid.getCartesian(xAxisModel.componentIndex, yAxisModel.componentIndex);
+      });
+      return grids;
+    }; // For deciding which dimensions to use when creating list data
+
+
+    Grid.dimensions = cartesian2DDimensions;
+    return Grid;
+  }();
+  /**
+   * Check if the axis is used in the specified grid.
+   */
+
+
+  function isAxisUsedInTheGrid(axisModel, gridModel) {
+    return axisModel.getCoordSysModel() === gridModel;
+  }
+
+  function fixAxisOnZero(axesMap, otherAxisDim, axis, // Key: see `getOnZeroRecordKey`
+  onZeroRecords) {
+    axis.getAxesOnZeroOf = function () {
+      // TODO: onZero of multiple axes.
+      return otherAxisOnZeroOf ? [otherAxisOnZeroOf] : [];
+    }; // onZero can not be enabled in these two situations:
+    // 1. When any other axis is a category axis.
+    // 2. When no axis is cross 0 point.
+
+
+    var otherAxes = axesMap[otherAxisDim];
+    var otherAxisOnZeroOf;
+    var axisModel = axis.model;
+    var onZero = axisModel.get(['axisLine', 'onZero']);
+    var onZeroAxisIndex = axisModel.get(['axisLine', 'onZeroAxisIndex']);
+
+    if (!onZero) {
+      return;
+    } // If target axis is specified.
+
+
+    if (onZeroAxisIndex != null) {
+      if (canOnZeroToAxis(otherAxes[onZeroAxisIndex])) {
+        otherAxisOnZeroOf = otherAxes[onZeroAxisIndex];
+      }
+    } else {
+      // Find the first available other axis.
+      for (var idx in otherAxes) {
+        if (otherAxes.hasOwnProperty(idx) && canOnZeroToAxis(otherAxes[idx]) // Consider that two Y axes on one value axis,
+        // if both onZero, the two Y axes overlap.
+        && !onZeroRecords[getOnZeroRecordKey(otherAxes[idx])]) {
+          otherAxisOnZeroOf = otherAxes[idx];
+          break;
+        }
+      }
+    }
+
+    if (otherAxisOnZeroOf) {
+      onZeroRecords[getOnZeroRecordKey(otherAxisOnZeroOf)] = true;
+    }
+
+    function getOnZeroRecordKey(axis) {
+      return axis.dim + '_' + axis.index;
+    }
+  }
+
+  function canOnZeroToAxis(axis) {
+    return axis && axis.type !== 'category' && axis.type !== 'time' && ifAxisCrossZero(axis);
+  }
+
+  function updateAxisTransform(axis, coordBase) {
+    var axisExtent = axis.getExtent();
+    var axisExtentSum = axisExtent[0] + axisExtent[1]; // Fast transform
+
+    axis.toGlobalCoord = axis.dim === 'x' ? function (coord) {
+      return coord + coordBase;
+    } : function (coord) {
+      return axisExtentSum - coord + coordBase;
+    };
+    axis.toLocalCoord = axis.dim === 'x' ? function (coord) {
+      return coord - coordBase;
+    } : function (coord) {
+      return axisExtentSum - coord + coordBase;
+    };
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var PI$4 = Math.PI;
+  /**
+   * A final axis is translated and rotated from a "standard axis".
+   * So opt.position and opt.rotation is required.
+   *
+   * A standard axis is and axis from [0, 0] to [0, axisExtent[1]],
+   * for example: (0, 0) ------------> (0, 50)
+   *
+   * nameDirection or tickDirection or labelDirection is 1 means tick
+   * or label is below the standard axis, whereas is -1 means above
+   * the standard axis. labelOffset means offset between label and axis,
+   * which is useful when 'onZero', where axisLabel is in the grid and
+   * label in outside grid.
+   *
+   * Tips: like always,
+   * positive rotation represents anticlockwise, and negative rotation
+   * represents clockwise.
+   * The direction of position coordinate is the same as the direction
+   * of screen coordinate.
+   *
+   * Do not need to consider axis 'inverse', which is auto processed by
+   * axis extent.
+   */
+
+  var AxisBuilder =
+  /** @class */
+  function () {
+    function AxisBuilder(axisModel, opt) {
+      this.group = new Group();
+      this.opt = opt;
+      this.axisModel = axisModel; // Default value
+
+      defaults(opt, {
+        labelOffset: 0,
+        nameDirection: 1,
+        tickDirection: 1,
+        labelDirection: 1,
+        silent: true,
+        handleAutoShown: function () {
+          return true;
+        }
+      }); // FIXME Not use a seperate text group?
+
+      var transformGroup = new Group({
+        x: opt.position[0],
+        y: opt.position[1],
+        rotation: opt.rotation
+      }); // this.group.add(transformGroup);
+      // this._transformGroup = transformGroup;
+
+      transformGroup.updateTransform();
+      this._transformGroup = transformGroup;
+    }
+
+    AxisBuilder.prototype.hasBuilder = function (name) {
+      return !!builders[name];
+    };
+
+    AxisBuilder.prototype.add = function (name) {
+      builders[name](this.opt, this.axisModel, this.group, this._transformGroup);
+    };
+
+    AxisBuilder.prototype.getGroup = function () {
+      return this.group;
+    };
+
+    AxisBuilder.innerTextLayout = function (axisRotation, textRotation, direction) {
+      var rotationDiff = remRadian(textRotation - axisRotation);
+      var textAlign;
+      var textVerticalAlign;
+
+      if (isRadianAroundZero(rotationDiff)) {
+        // Label is parallel with axis line.
+        textVerticalAlign = direction > 0 ? 'top' : 'bottom';
+        textAlign = 'center';
+      } else if (isRadianAroundZero(rotationDiff - PI$4)) {
+        // Label is inverse parallel with axis line.
+        textVerticalAlign = direction > 0 ? 'bottom' : 'top';
+        textAlign = 'center';
+      } else {
+        textVerticalAlign = 'middle';
+
+        if (rotationDiff > 0 && rotationDiff < PI$4) {
+          textAlign = direction > 0 ? 'right' : 'left';
+        } else {
+          textAlign = direction > 0 ? 'left' : 'right';
+        }
+      }
+
+      return {
+        rotation: rotationDiff,
+        textAlign: textAlign,
+        textVerticalAlign: textVerticalAlign
+      };
+    };
+
+    AxisBuilder.makeAxisEventDataBase = function (axisModel) {
+      var eventData = {
+        componentType: axisModel.mainType,
+        componentIndex: axisModel.componentIndex
+      };
+      eventData[axisModel.mainType + 'Index'] = axisModel.componentIndex;
+      return eventData;
+    };
+
+    AxisBuilder.isLabelSilent = function (axisModel) {
+      var tooltipOpt = axisModel.get('tooltip');
+      return axisModel.get('silent') // Consider mouse cursor, add these restrictions.
+      || !(axisModel.get('triggerEvent') || tooltipOpt && tooltipOpt.show);
+    };
+
+    return AxisBuilder;
+  }();
+
+  var builders = {
+    axisLine: function (opt, axisModel, group, transformGroup) {
+      var shown = axisModel.get(['axisLine', 'show']);
+
+      if (shown === 'auto' && opt.handleAutoShown) {
+        shown = opt.handleAutoShown('axisLine');
+      }
+
+      if (!shown) {
+        return;
+      }
+
+      var extent = axisModel.axis.getExtent();
+      var matrix = transformGroup.transform;
+      var pt1 = [extent[0], 0];
+      var pt2 = [extent[1], 0];
+      var inverse = pt1[0] > pt2[0];
+
+      if (matrix) {
+        applyTransform(pt1, pt1, matrix);
+        applyTransform(pt2, pt2, matrix);
+      }
+
+      var lineStyle = extend({
+        lineCap: 'round'
+      }, axisModel.getModel(['axisLine', 'lineStyle']).getLineStyle());
+      var line = new Line({
+        shape: {
+          x1: pt1[0],
+          y1: pt1[1],
+          x2: pt2[0],
+          y2: pt2[1]
+        },
+        style: lineStyle,
+        strokeContainThreshold: opt.strokeContainThreshold || 5,
+        silent: true,
+        z2: 1
+      });
+      subPixelOptimizeLine$1(line.shape, line.style.lineWidth);
+      line.anid = 'line';
+      group.add(line);
+      var arrows = axisModel.get(['axisLine', 'symbol']);
+
+      if (arrows != null) {
+        var arrowSize = axisModel.get(['axisLine', 'symbolSize']);
+
+        if (isString(arrows)) {
+          // Use the same arrow for start and end point
+          arrows = [arrows, arrows];
+        }
+
+        if (isString(arrowSize) || isNumber(arrowSize)) {
+          // Use the same size for width and height
+          arrowSize = [arrowSize, arrowSize];
+        }
+
+        var arrowOffset = normalizeSymbolOffset(axisModel.get(['axisLine', 'symbolOffset']) || 0, arrowSize);
+        var symbolWidth_1 = arrowSize[0];
+        var symbolHeight_1 = arrowSize[1];
+        each([{
+          rotate: opt.rotation + Math.PI / 2,
+          offset: arrowOffset[0],
+          r: 0
+        }, {
+          rotate: opt.rotation - Math.PI / 2,
+          offset: arrowOffset[1],
+          r: Math.sqrt((pt1[0] - pt2[0]) * (pt1[0] - pt2[0]) + (pt1[1] - pt2[1]) * (pt1[1] - pt2[1]))
+        }], function (point, index) {
+          if (arrows[index] !== 'none' && arrows[index] != null) {
+            var symbol = createSymbol(arrows[index], -symbolWidth_1 / 2, -symbolHeight_1 / 2, symbolWidth_1, symbolHeight_1, lineStyle.stroke, true); // Calculate arrow position with offset
+
+            var r = point.r + point.offset;
+            var pt = inverse ? pt2 : pt1;
+            symbol.attr({
+              rotation: point.rotate,
+              x: pt[0] + r * Math.cos(opt.rotation),
+              y: pt[1] - r * Math.sin(opt.rotation),
+              silent: true,
+              z2: 11
+            });
+            group.add(symbol);
+          }
+        });
+      }
+    },
+    axisTickLabel: function (opt, axisModel, group, transformGroup) {
+      var ticksEls = buildAxisMajorTicks(group, transformGroup, axisModel, opt);
+      var labelEls = buildAxisLabel(group, transformGroup, axisModel, opt);
+      fixMinMaxLabelShow(axisModel, labelEls, ticksEls);
+      buildAxisMinorTicks(group, transformGroup, axisModel, opt.tickDirection); // This bit fixes the label overlap issue for the time chart.
+      // See https://github.com/apache/echarts/issues/14266 for more.
+
+      if (axisModel.get(['axisLabel', 'hideOverlap'])) {
+        var labelList = prepareLayoutList(map(labelEls, function (label) {
+          return {
+            label: label,
+            priority: label.z2,
+            defaultAttr: {
+              ignore: label.ignore
+            }
+          };
+        }));
+        hideOverlap(labelList);
+      }
+    },
+    axisName: function (opt, axisModel, group, transformGroup) {
+      var name = retrieve(opt.axisName, axisModel.get('name'));
+
+      if (!name) {
+        return;
+      }
+
+      var nameLocation = axisModel.get('nameLocation');
+      var nameDirection = opt.nameDirection;
+      var textStyleModel = axisModel.getModel('nameTextStyle');
+      var gap = axisModel.get('nameGap') || 0;
+      var extent = axisModel.axis.getExtent();
+      var gapSignal = extent[0] > extent[1] ? -1 : 1;
+      var pos = [nameLocation === 'start' ? extent[0] - gapSignal * gap : nameLocation === 'end' ? extent[1] + gapSignal * gap : (extent[0] + extent[1]) / 2, // Reuse labelOffset.
+      isNameLocationCenter(nameLocation) ? opt.labelOffset + nameDirection * gap : 0];
+      var labelLayout;
+      var nameRotation = axisModel.get('nameRotate');
+
+      if (nameRotation != null) {
+        nameRotation = nameRotation * PI$4 / 180; // To radian.
+      }
+
+      var axisNameAvailableWidth;
+
+      if (isNameLocationCenter(nameLocation)) {
+        labelLayout = AxisBuilder.innerTextLayout(opt.rotation, nameRotation != null ? nameRotation : opt.rotation, // Adapt to axis.
+        nameDirection);
+      } else {
+        labelLayout = endTextLayout(opt.rotation, nameLocation, nameRotation || 0, extent);
+        axisNameAvailableWidth = opt.axisNameAvailableWidth;
+
+        if (axisNameAvailableWidth != null) {
+          axisNameAvailableWidth = Math.abs(axisNameAvailableWidth / Math.sin(labelLayout.rotation));
+          !isFinite(axisNameAvailableWidth) && (axisNameAvailableWidth = null);
+        }
+      }
+
+      var textFont = textStyleModel.getFont();
+      var truncateOpt = axisModel.get('nameTruncate', true) || {};
+      var ellipsis = truncateOpt.ellipsis;
+      var maxWidth = retrieve(opt.nameTruncateMaxWidth, truncateOpt.maxWidth, axisNameAvailableWidth);
+      var textEl = new ZRText({
+        x: pos[0],
+        y: pos[1],
+        rotation: labelLayout.rotation,
+        silent: AxisBuilder.isLabelSilent(axisModel),
+        style: createTextStyle(textStyleModel, {
+          text: name,
+          font: textFont,
+          overflow: 'truncate',
+          width: maxWidth,
+          ellipsis: ellipsis,
+          fill: textStyleModel.getTextColor() || axisModel.get(['axisLine', 'lineStyle', 'color']),
+          align: textStyleModel.get('align') || labelLayout.textAlign,
+          verticalAlign: textStyleModel.get('verticalAlign') || labelLayout.textVerticalAlign
+        }),
+        z2: 1
+      });
+      setTooltipConfig({
+        el: textEl,
+        componentModel: axisModel,
+        itemName: name
+      });
+      textEl.__fullText = name; // Id for animation
+
+      textEl.anid = 'name';
+
+      if (axisModel.get('triggerEvent')) {
+        var eventData = AxisBuilder.makeAxisEventDataBase(axisModel);
+        eventData.targetType = 'axisName';
+        eventData.name = name;
+        getECData(textEl).eventData = eventData;
+      } // FIXME
+
+
+      transformGroup.add(textEl);
+      textEl.updateTransform();
+      group.add(textEl);
+      textEl.decomposeTransform();
+    }
+  };
+
+  function endTextLayout(rotation, textPosition, textRotate, extent) {
+    var rotationDiff = remRadian(textRotate - rotation);
+    var textAlign;
+    var textVerticalAlign;
+    var inverse = extent[0] > extent[1];
+    var onLeft = textPosition === 'start' && !inverse || textPosition !== 'start' && inverse;
+
+    if (isRadianAroundZero(rotationDiff - PI$4 / 2)) {
+      textVerticalAlign = onLeft ? 'bottom' : 'top';
+      textAlign = 'center';
+    } else if (isRadianAroundZero(rotationDiff - PI$4 * 1.5)) {
+      textVerticalAlign = onLeft ? 'top' : 'bottom';
+      textAlign = 'center';
+    } else {
+      textVerticalAlign = 'middle';
+
+      if (rotationDiff < PI$4 * 1.5 && rotationDiff > PI$4 / 2) {
+        textAlign = onLeft ? 'left' : 'right';
+      } else {
+        textAlign = onLeft ? 'right' : 'left';
+      }
+    }
+
+    return {
+      rotation: rotationDiff,
+      textAlign: textAlign,
+      textVerticalAlign: textVerticalAlign
+    };
+  }
+
+  function fixMinMaxLabelShow(axisModel, labelEls, tickEls) {
+    if (shouldShowAllLabels(axisModel.axis)) {
+      return;
+    } // If min or max are user set, we need to check
+    // If the tick on min(max) are overlap on their neighbour tick
+    // If they are overlapped, we need to hide the min(max) tick label
+
+
+    var showMinLabel = axisModel.get(['axisLabel', 'showMinLabel']);
+    var showMaxLabel = axisModel.get(['axisLabel', 'showMaxLabel']); // FIXME
+    // Have not consider onBand yet, where tick els is more than label els.
+
+    labelEls = labelEls || [];
+    tickEls = tickEls || [];
+    var firstLabel = labelEls[0];
+    var nextLabel = labelEls[1];
+    var lastLabel = labelEls[labelEls.length - 1];
+    var prevLabel = labelEls[labelEls.length - 2];
+    var firstTick = tickEls[0];
+    var nextTick = tickEls[1];
+    var lastTick = tickEls[tickEls.length - 1];
+    var prevTick = tickEls[tickEls.length - 2];
+
+    if (showMinLabel === false) {
+      ignoreEl(firstLabel);
+      ignoreEl(firstTick);
+    } else if (isTwoLabelOverlapped(firstLabel, nextLabel)) {
+      if (showMinLabel) {
+        ignoreEl(nextLabel);
+        ignoreEl(nextTick);
+      } else {
+        ignoreEl(firstLabel);
+        ignoreEl(firstTick);
+      }
+    }
+
+    if (showMaxLabel === false) {
+      ignoreEl(lastLabel);
+      ignoreEl(lastTick);
+    } else if (isTwoLabelOverlapped(prevLabel, lastLabel)) {
+      if (showMaxLabel) {
+        ignoreEl(prevLabel);
+        ignoreEl(prevTick);
+      } else {
+        ignoreEl(lastLabel);
+        ignoreEl(lastTick);
+      }
+    }
+  }
+
+  function ignoreEl(el) {
+    el && (el.ignore = true);
+  }
+
+  function isTwoLabelOverlapped(current, next) {
+    // current and next has the same rotation.
+    var firstRect = current && current.getBoundingRect().clone();
+    var nextRect = next && next.getBoundingRect().clone();
+
+    if (!firstRect || !nextRect) {
+      return;
+    } // When checking intersect of two rotated labels, we use mRotationBack
+    // to avoid that boundingRect is enlarge when using `boundingRect.applyTransform`.
+
+
+    var mRotationBack = identity([]);
+    rotate(mRotationBack, mRotationBack, -current.rotation);
+    firstRect.applyTransform(mul$1([], mRotationBack, current.getLocalTransform()));
+    nextRect.applyTransform(mul$1([], mRotationBack, next.getLocalTransform()));
+    return firstRect.intersect(nextRect);
+  }
+
+  function isNameLocationCenter(nameLocation) {
+    return nameLocation === 'middle' || nameLocation === 'center';
+  }
+
+  function createTicks(ticksCoords, tickTransform, tickEndCoord, tickLineStyle, anidPrefix) {
+    var tickEls = [];
+    var pt1 = [];
+    var pt2 = [];
+
+    for (var i = 0; i < ticksCoords.length; i++) {
+      var tickCoord = ticksCoords[i].coord;
+      pt1[0] = tickCoord;
+      pt1[1] = 0;
+      pt2[0] = tickCoord;
+      pt2[1] = tickEndCoord;
+
+      if (tickTransform) {
+        applyTransform(pt1, pt1, tickTransform);
+        applyTransform(pt2, pt2, tickTransform);
+      } // Tick line, Not use group transform to have better line draw
+
+
+      var tickEl = new Line({
+        shape: {
+          x1: pt1[0],
+          y1: pt1[1],
+          x2: pt2[0],
+          y2: pt2[1]
+        },
+        style: tickLineStyle,
+        z2: 2,
+        autoBatch: true,
+        silent: true
+      });
+      subPixelOptimizeLine$1(tickEl.shape, tickEl.style.lineWidth);
+      tickEl.anid = anidPrefix + '_' + ticksCoords[i].tickValue;
+      tickEls.push(tickEl);
+    }
+
+    return tickEls;
+  }
+
+  function buildAxisMajorTicks(group, transformGroup, axisModel, opt) {
+    var axis = axisModel.axis;
+    var tickModel = axisModel.getModel('axisTick');
+    var shown = tickModel.get('show');
+
+    if (shown === 'auto' && opt.handleAutoShown) {
+      shown = opt.handleAutoShown('axisTick');
+    }
+
+    if (!shown || axis.scale.isBlank()) {
+      return;
+    }
+
+    var lineStyleModel = tickModel.getModel('lineStyle');
+    var tickEndCoord = opt.tickDirection * tickModel.get('length');
+    var ticksCoords = axis.getTicksCoords();
+    var ticksEls = createTicks(ticksCoords, transformGroup.transform, tickEndCoord, defaults(lineStyleModel.getLineStyle(), {
+      stroke: axisModel.get(['axisLine', 'lineStyle', 'color'])
+    }), 'ticks');
+
+    for (var i = 0; i < ticksEls.length; i++) {
+      group.add(ticksEls[i]);
+    }
+
+    return ticksEls;
+  }
+
+  function buildAxisMinorTicks(group, transformGroup, axisModel, tickDirection) {
+    var axis = axisModel.axis;
+    var minorTickModel = axisModel.getModel('minorTick');
+
+    if (!minorTickModel.get('show') || axis.scale.isBlank()) {
+      return;
+    }
+
+    var minorTicksCoords = axis.getMinorTicksCoords();
+
+    if (!minorTicksCoords.length) {
+      return;
+    }
+
+    var lineStyleModel = minorTickModel.getModel('lineStyle');
+    var tickEndCoord = tickDirection * minorTickModel.get('length');
+    var minorTickLineStyle = defaults(lineStyleModel.getLineStyle(), defaults(axisModel.getModel('axisTick').getLineStyle(), {
+      stroke: axisModel.get(['axisLine', 'lineStyle', 'color'])
+    }));
+
+    for (var i = 0; i < minorTicksCoords.length; i++) {
+      var minorTicksEls = createTicks(minorTicksCoords[i], transformGroup.transform, tickEndCoord, minorTickLineStyle, 'minorticks_' + i);
+
+      for (var k = 0; k < minorTicksEls.length; k++) {
+        group.add(minorTicksEls[k]);
+      }
+    }
+  }
+
+  function buildAxisLabel(group, transformGroup, axisModel, opt) {
+    var axis = axisModel.axis;
+    var show = retrieve(opt.axisLabelShow, axisModel.get(['axisLabel', 'show']));
+
+    if (!show || axis.scale.isBlank()) {
+      return;
+    }
+
+    var labelModel = axisModel.getModel('axisLabel');
+    var labelMargin = labelModel.get('margin');
+    var labels = axis.getViewLabels(); // Special label rotate.
+
+    var labelRotation = (retrieve(opt.labelRotate, labelModel.get('rotate')) || 0) * PI$4 / 180;
+    var labelLayout = AxisBuilder.innerTextLayout(opt.rotation, labelRotation, opt.labelDirection);
+    var rawCategoryData = axisModel.getCategories && axisModel.getCategories(true);
+    var labelEls = [];
+    var silent = AxisBuilder.isLabelSilent(axisModel);
+    var triggerEvent = axisModel.get('triggerEvent');
+    each(labels, function (labelItem, index) {
+      var tickValue = axis.scale.type === 'ordinal' ? axis.scale.getRawOrdinalNumber(labelItem.tickValue) : labelItem.tickValue;
+      var formattedLabel = labelItem.formattedLabel;
+      var rawLabel = labelItem.rawLabel;
+      var itemLabelModel = labelModel;
+
+      if (rawCategoryData && rawCategoryData[tickValue]) {
+        var rawCategoryItem = rawCategoryData[tickValue];
+
+        if (isObject(rawCategoryItem) && rawCategoryItem.textStyle) {
+          itemLabelModel = new Model(rawCategoryItem.textStyle, labelModel, axisModel.ecModel);
+        }
+      }
+
+      var textColor = itemLabelModel.getTextColor() || axisModel.get(['axisLine', 'lineStyle', 'color']);
+      var tickCoord = axis.dataToCoord(tickValue);
+      var textEl = new ZRText({
+        x: tickCoord,
+        y: opt.labelOffset + opt.labelDirection * labelMargin,
+        rotation: labelLayout.rotation,
+        silent: silent,
+        z2: 10 + (labelItem.level || 0),
+        style: createTextStyle(itemLabelModel, {
+          text: formattedLabel,
+          align: itemLabelModel.getShallow('align', true) || labelLayout.textAlign,
+          verticalAlign: itemLabelModel.getShallow('verticalAlign', true) || itemLabelModel.getShallow('baseline', true) || labelLayout.textVerticalAlign,
+          fill: isFunction(textColor) ? textColor( // (1) In category axis with data zoom, tick is not the original
+          // index of axis.data. So tick should not be exposed to user
+          // in category axis.
+          // (2) Compatible with previous version, which always use formatted label as
+          // input. But in interval scale the formatted label is like '223,445', which
+          // maked user repalce ','. So we modify it to return original val but remain
+          // it as 'string' to avoid error in replacing.
+          axis.type === 'category' ? rawLabel : axis.type === 'value' ? tickValue + '' : tickValue, index) : textColor
+        })
+      });
+      textEl.anid = 'label_' + tickValue; // Pack data for mouse event
+
+      if (triggerEvent) {
+        var eventData = AxisBuilder.makeAxisEventDataBase(axisModel);
+        eventData.targetType = 'axisLabel';
+        eventData.value = rawLabel;
+        eventData.tickIndex = index;
+
+        if (axis.type === 'category') {
+          eventData.dataIndex = tickValue;
+        }
+
+        getECData(textEl).eventData = eventData;
+      } // FIXME
+
+
+      transformGroup.add(textEl);
+      textEl.updateTransform();
+      labelEls.push(textEl);
+      group.add(textEl);
+      textEl.decomposeTransform();
+    });
+    return labelEls;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+  // allAxesInfo should be updated when setOption performed.
+
+
+  function collect(ecModel, api) {
+    var result = {
+      /**
+       * key: makeKey(axis.model)
+       * value: {
+       *      axis,
+       *      coordSys,
+       *      axisPointerModel,
+       *      triggerTooltip,
+       *      involveSeries,
+       *      snap,
+       *      seriesModels,
+       *      seriesDataCount
+       * }
+       */
+      axesInfo: {},
+      seriesInvolved: false,
+
+      /**
+       * key: makeKey(coordSys.model)
+       * value: Object: key makeKey(axis.model), value: axisInfo
+       */
+      coordSysAxesInfo: {},
+      coordSysMap: {}
+    };
+    collectAxesInfo(result, ecModel, api); // Check seriesInvolved for performance, in case too many series in some chart.
+
+    result.seriesInvolved && collectSeriesInfo(result, ecModel);
+    return result;
+  }
+
+  function collectAxesInfo(result, ecModel, api) {
+    var globalTooltipModel = ecModel.getComponent('tooltip');
+    var globalAxisPointerModel = ecModel.getComponent('axisPointer'); // links can only be set on global.
+
+    var linksOption = globalAxisPointerModel.get('link', true) || [];
+    var linkGroups = []; // Collect axes info.
+
+    each(api.getCoordinateSystems(), function (coordSys) {
+      // Some coordinate system do not support axes, like geo.
+      if (!coordSys.axisPointerEnabled) {
+        return;
+      }
+
+      var coordSysKey = makeKey(coordSys.model);
+      var axesInfoInCoordSys = result.coordSysAxesInfo[coordSysKey] = {};
+      result.coordSysMap[coordSysKey] = coordSys; // Set tooltip (like 'cross') is a convienent way to show axisPointer
+      // for user. So we enable seting tooltip on coordSys model.
+
+      var coordSysModel = coordSys.model;
+      var baseTooltipModel = coordSysModel.getModel('tooltip', globalTooltipModel);
+      each(coordSys.getAxes(), curry(saveTooltipAxisInfo, false, null)); // If axis tooltip used, choose tooltip axis for each coordSys.
+      // Notice this case: coordSys is `grid` but not `cartesian2D` here.
+
+      if (coordSys.getTooltipAxes && globalTooltipModel // If tooltip.showContent is set as false, tooltip will not
+      // show but axisPointer will show as normal.
+      && baseTooltipModel.get('show')) {
+        // Compatible with previous logic. But series.tooltip.trigger: 'axis'
+        // or series.data[n].tooltip.trigger: 'axis' are not support any more.
+        var triggerAxis = baseTooltipModel.get('trigger') === 'axis';
+        var cross = baseTooltipModel.get(['axisPointer', 'type']) === 'cross';
+        var tooltipAxes = coordSys.getTooltipAxes(baseTooltipModel.get(['axisPointer', 'axis']));
+
+        if (triggerAxis || cross) {
+          each(tooltipAxes.baseAxes, curry(saveTooltipAxisInfo, cross ? 'cross' : true, triggerAxis));
+        }
+
+        if (cross) {
+          each(tooltipAxes.otherAxes, curry(saveTooltipAxisInfo, 'cross', false));
+        }
+      } // fromTooltip: true | false | 'cross'
+      // triggerTooltip: true | false | null
+
+
+      function saveTooltipAxisInfo(fromTooltip, triggerTooltip, axis) {
+        var axisPointerModel = axis.model.getModel('axisPointer', globalAxisPointerModel);
+        var axisPointerShow = axisPointerModel.get('show');
+
+        if (!axisPointerShow || axisPointerShow === 'auto' && !fromTooltip && !isHandleTrigger(axisPointerModel)) {
+          return;
+        }
+
+        if (triggerTooltip == null) {
+          triggerTooltip = axisPointerModel.get('triggerTooltip');
+        }
+
+        axisPointerModel = fromTooltip ? makeAxisPointerModel(axis, baseTooltipModel, globalAxisPointerModel, ecModel, fromTooltip, triggerTooltip) : axisPointerModel;
+        var snap = axisPointerModel.get('snap');
+        var axisKey = makeKey(axis.model);
+        var involveSeries = triggerTooltip || snap || axis.type === 'category'; // If result.axesInfo[key] exist, override it (tooltip has higher priority).
+
+        var axisInfo = result.axesInfo[axisKey] = {
+          key: axisKey,
+          axis: axis,
+          coordSys: coordSys,
+          axisPointerModel: axisPointerModel,
+          triggerTooltip: triggerTooltip,
+          involveSeries: involveSeries,
+          snap: snap,
+          useHandle: isHandleTrigger(axisPointerModel),
+          seriesModels: [],
+          linkGroup: null
+        };
+        axesInfoInCoordSys[axisKey] = axisInfo;
+        result.seriesInvolved = result.seriesInvolved || involveSeries;
+        var groupIndex = getLinkGroupIndex(linksOption, axis);
+
+        if (groupIndex != null) {
+          var linkGroup = linkGroups[groupIndex] || (linkGroups[groupIndex] = {
+            axesInfo: {}
+          });
+          linkGroup.axesInfo[axisKey] = axisInfo;
+          linkGroup.mapper = linksOption[groupIndex].mapper;
+          axisInfo.linkGroup = linkGroup;
+        }
+      }
+    });
+  }
+
+  function makeAxisPointerModel(axis, baseTooltipModel, globalAxisPointerModel, ecModel, fromTooltip, triggerTooltip) {
+    var tooltipAxisPointerModel = baseTooltipModel.getModel('axisPointer');
+    var fields = ['type', 'snap', 'lineStyle', 'shadowStyle', 'label', 'animation', 'animationDurationUpdate', 'animationEasingUpdate', 'z'];
+    var volatileOption = {};
+    each(fields, function (field) {
+      volatileOption[field] = clone(tooltipAxisPointerModel.get(field));
+    }); // category axis do not auto snap, otherwise some tick that do not
+    // has value can not be hovered. value/time/log axis default snap if
+    // triggered from tooltip and trigger tooltip.
+
+    volatileOption.snap = axis.type !== 'category' && !!triggerTooltip; // Compatibel with previous behavior, tooltip axis do not show label by default.
+    // Only these properties can be overrided from tooltip to axisPointer.
+
+    if (tooltipAxisPointerModel.get('type') === 'cross') {
+      volatileOption.type = 'line';
+    }
+
+    var labelOption = volatileOption.label || (volatileOption.label = {}); // Follow the convention, do not show label when triggered by tooltip by default.
+
+    labelOption.show == null && (labelOption.show = false);
+
+    if (fromTooltip === 'cross') {
+      // When 'cross', both axes show labels.
+      var tooltipAxisPointerLabelShow = tooltipAxisPointerModel.get(['label', 'show']);
+      labelOption.show = tooltipAxisPointerLabelShow != null ? tooltipAxisPointerLabelShow : true; // If triggerTooltip, this is a base axis, which should better not use cross style
+      // (cross style is dashed by default)
+
+      if (!triggerTooltip) {
+        var crossStyle = volatileOption.lineStyle = tooltipAxisPointerModel.get('crossStyle');
+        crossStyle && defaults(labelOption, crossStyle.textStyle);
+      }
+    }
+
+    return axis.model.getModel('axisPointer', new Model(volatileOption, globalAxisPointerModel, ecModel));
+  }
+
+  function collectSeriesInfo(result, ecModel) {
+    // Prepare data for axis trigger
+    ecModel.eachSeries(function (seriesModel) {
+      // Notice this case: this coordSys is `cartesian2D` but not `grid`.
+      var coordSys = seriesModel.coordinateSystem;
+      var seriesTooltipTrigger = seriesModel.get(['tooltip', 'trigger'], true);
+      var seriesTooltipShow = seriesModel.get(['tooltip', 'show'], true);
+
+      if (!coordSys || seriesTooltipTrigger === 'none' || seriesTooltipTrigger === false || seriesTooltipTrigger === 'item' || seriesTooltipShow === false || seriesModel.get(['axisPointer', 'show'], true) === false) {
+        return;
+      }
+
+      each(result.coordSysAxesInfo[makeKey(coordSys.model)], function (axisInfo) {
+        var axis = axisInfo.axis;
+
+        if (coordSys.getAxis(axis.dim) === axis) {
+          axisInfo.seriesModels.push(seriesModel);
+          axisInfo.seriesDataCount == null && (axisInfo.seriesDataCount = 0);
+          axisInfo.seriesDataCount += seriesModel.getData().count();
+        }
+      });
+    });
+  }
+  /**
+   * For example:
+   * {
+   *     axisPointer: {
+   *         links: [{
+   *             xAxisIndex: [2, 4],
+   *             yAxisIndex: 'all'
+   *         }, {
+   *             xAxisId: ['a5', 'a7'],
+   *             xAxisName: 'xxx'
+   *         }]
+   *     }
+   * }
+   */
+
+
+  function getLinkGroupIndex(linksOption, axis) {
+    var axisModel = axis.model;
+    var dim = axis.dim;
+
+    for (var i = 0; i < linksOption.length; i++) {
+      var linkOption = linksOption[i] || {};
+
+      if (checkPropInLink(linkOption[dim + 'AxisId'], axisModel.id) || checkPropInLink(linkOption[dim + 'AxisIndex'], axisModel.componentIndex) || checkPropInLink(linkOption[dim + 'AxisName'], axisModel.name)) {
+        return i;
+      }
+    }
+  }
+
+  function checkPropInLink(linkPropValue, axisPropValue) {
+    return linkPropValue === 'all' || isArray(linkPropValue) && indexOf(linkPropValue, axisPropValue) >= 0 || linkPropValue === axisPropValue;
+  }
+
+  function fixValue(axisModel) {
+    var axisInfo = getAxisInfo(axisModel);
+
+    if (!axisInfo) {
+      return;
+    }
+
+    var axisPointerModel = axisInfo.axisPointerModel;
+    var scale = axisInfo.axis.scale;
+    var option = axisPointerModel.option;
+    var status = axisPointerModel.get('status');
+    var value = axisPointerModel.get('value'); // Parse init value for category and time axis.
+
+    if (value != null) {
+      value = scale.parse(value);
+    }
+
+    var useHandle = isHandleTrigger(axisPointerModel); // If `handle` used, `axisPointer` will always be displayed, so value
+    // and status should be initialized.
+
+    if (status == null) {
+      option.status = useHandle ? 'show' : 'hide';
+    }
+
+    var extent = scale.getExtent().slice();
+    extent[0] > extent[1] && extent.reverse();
+
+    if ( // Pick a value on axis when initializing.
+    value == null // If both `handle` and `dataZoom` are used, value may be out of axis extent,
+    // where we should re-pick a value to keep `handle` displaying normally.
+    || value > extent[1]) {
+      // Make handle displayed on the end of the axis when init, which looks better.
+      value = extent[1];
+    }
+
+    if (value < extent[0]) {
+      value = extent[0];
+    }
+
+    option.value = value;
+
+    if (useHandle) {
+      option.status = axisInfo.axis.scale.isBlank() ? 'hide' : 'show';
+    }
+  }
+
+  function getAxisInfo(axisModel) {
+    var coordSysAxesInfo = (axisModel.ecModel.getComponent('axisPointer') || {}).coordSysAxesInfo;
+    return coordSysAxesInfo && coordSysAxesInfo.axesInfo[makeKey(axisModel)];
+  }
+
+  function getAxisPointerModel(axisModel) {
+    var axisInfo = getAxisInfo(axisModel);
+    return axisInfo && axisInfo.axisPointerModel;
+  }
+
+  function isHandleTrigger(axisPointerModel) {
+    return !!axisPointerModel.get(['handle', 'show']);
+  }
+  /**
+   * @param {module:echarts/model/Model} model
+   * @return {string} unique key
+   */
+
+
+  function makeKey(model) {
+    return model.type + '||' + model.id;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var axisPointerClazz = {};
+  /**
+   * Base class of AxisView.
+   */
+
+  var AxisView =
+  /** @class */
+  function (_super) {
+    __extends(AxisView, _super);
+
+    function AxisView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = AxisView.type;
+      return _this;
+    }
+    /**
+     * @override
+     */
+
+
+    AxisView.prototype.render = function (axisModel, ecModel, api, payload) {
+      // FIXME
+      // This process should proformed after coordinate systems updated
+      // (axis scale updated), and should be performed each time update.
+      // So put it here temporarily, although it is not appropriate to
+      // put a model-writing procedure in `view`.
+      this.axisPointerClass && fixValue(axisModel);
+
+      _super.prototype.render.apply(this, arguments);
+
+      this._doUpdateAxisPointerClass(axisModel, api, true);
+    };
+    /**
+     * Action handler.
+     */
+
+
+    AxisView.prototype.updateAxisPointer = function (axisModel, ecModel, api, payload) {
+      this._doUpdateAxisPointerClass(axisModel, api, false);
+    };
+    /**
+     * @override
+     */
+
+
+    AxisView.prototype.remove = function (ecModel, api) {
+      var axisPointer = this._axisPointer;
+      axisPointer && axisPointer.remove(api);
+    };
+    /**
+     * @override
+     */
+
+
+    AxisView.prototype.dispose = function (ecModel, api) {
+      this._disposeAxisPointer(api);
+
+      _super.prototype.dispose.apply(this, arguments);
+    };
+
+    AxisView.prototype._doUpdateAxisPointerClass = function (axisModel, api, forceRender) {
+      var Clazz = AxisView.getAxisPointerClass(this.axisPointerClass);
+
+      if (!Clazz) {
+        return;
+      }
+
+      var axisPointerModel = getAxisPointerModel(axisModel);
+      axisPointerModel ? (this._axisPointer || (this._axisPointer = new Clazz())).render(axisModel, axisPointerModel, api, forceRender) : this._disposeAxisPointer(api);
+    };
+
+    AxisView.prototype._disposeAxisPointer = function (api) {
+      this._axisPointer && this._axisPointer.dispose(api);
+      this._axisPointer = null;
+    };
+
+    AxisView.registerAxisPointerClass = function (type, clazz) {
+      {
+        if (axisPointerClazz[type]) {
+          throw new Error('axisPointer ' + type + ' exists');
+        }
+      }
+      axisPointerClazz[type] = clazz;
+    };
+
+    AxisView.getAxisPointerClass = function (type) {
+      return type && axisPointerClazz[type];
+    };
+
+    AxisView.type = 'axis';
+    return AxisView;
+  }(ComponentView);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var inner$6 = makeInner();
+
+  function rectCoordAxisBuildSplitArea(axisView, axisGroup, axisModel, gridModel) {
+    var axis = axisModel.axis;
+
+    if (axis.scale.isBlank()) {
+      return;
+    } // TODO: TYPE
+
+
+    var splitAreaModel = axisModel.getModel('splitArea');
+    var areaStyleModel = splitAreaModel.getModel('areaStyle');
+    var areaColors = areaStyleModel.get('color');
+    var gridRect = gridModel.coordinateSystem.getRect();
+    var ticksCoords = axis.getTicksCoords({
+      tickModel: splitAreaModel,
+      clamp: true
+    });
+
+    if (!ticksCoords.length) {
+      return;
+    } // For Making appropriate splitArea animation, the color and anid
+    // should be corresponding to previous one if possible.
+
+
+    var areaColorsLen = areaColors.length;
+    var lastSplitAreaColors = inner$6(axisView).splitAreaColors;
+    var newSplitAreaColors = createHashMap();
+    var colorIndex = 0;
+
+    if (lastSplitAreaColors) {
+      for (var i = 0; i < ticksCoords.length; i++) {
+        var cIndex = lastSplitAreaColors.get(ticksCoords[i].tickValue);
+
+        if (cIndex != null) {
+          colorIndex = (cIndex + (areaColorsLen - 1) * i) % areaColorsLen;
+          break;
+        }
+      }
+    }
+
+    var prev = axis.toGlobalCoord(ticksCoords[0].coord);
+    var areaStyle = areaStyleModel.getAreaStyle();
+    areaColors = isArray(areaColors) ? areaColors : [areaColors];
+
+    for (var i = 1; i < ticksCoords.length; i++) {
+      var tickCoord = axis.toGlobalCoord(ticksCoords[i].coord);
+      var x = void 0;
+      var y = void 0;
+      var width = void 0;
+      var height = void 0;
+
+      if (axis.isHorizontal()) {
+        x = prev;
+        y = gridRect.y;
+        width = tickCoord - x;
+        height = gridRect.height;
+        prev = x + width;
+      } else {
+        x = gridRect.x;
+        y = prev;
+        width = gridRect.width;
+        height = tickCoord - y;
+        prev = y + height;
+      }
+
+      var tickValue = ticksCoords[i - 1].tickValue;
+      tickValue != null && newSplitAreaColors.set(tickValue, colorIndex);
+      axisGroup.add(new Rect({
+        anid: tickValue != null ? 'area_' + tickValue : null,
+        shape: {
+          x: x,
+          y: y,
+          width: width,
+          height: height
+        },
+        style: defaults({
+          fill: areaColors[colorIndex]
+        }, areaStyle),
+        autoBatch: true,
+        silent: true
+      }));
+      colorIndex = (colorIndex + 1) % areaColorsLen;
+    }
+
+    inner$6(axisView).splitAreaColors = newSplitAreaColors;
+  }
+
+  function rectCoordAxisHandleRemove(axisView) {
+    inner$6(axisView).splitAreaColors = null;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var axisBuilderAttrs = ['axisLine', 'axisTickLabel', 'axisName'];
+  var selfBuilderAttrs = ['splitArea', 'splitLine', 'minorSplitLine'];
+
+  var CartesianAxisView =
+  /** @class */
+  function (_super) {
+    __extends(CartesianAxisView, _super);
+
+    function CartesianAxisView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = CartesianAxisView.type;
+      _this.axisPointerClass = 'CartesianAxisPointer';
+      return _this;
+    }
+    /**
+     * @override
+     */
+
+
+    CartesianAxisView.prototype.render = function (axisModel, ecModel, api, payload) {
+      this.group.removeAll();
+      var oldAxisGroup = this._axisGroup;
+      this._axisGroup = new Group();
+      this.group.add(this._axisGroup);
+
+      if (!axisModel.get('show')) {
+        return;
+      }
+
+      var gridModel = axisModel.getCoordSysModel();
+      var layout = layout$1(gridModel, axisModel);
+      var axisBuilder = new AxisBuilder(axisModel, extend({
+        handleAutoShown: function (elementType) {
+          var cartesians = gridModel.coordinateSystem.getCartesians();
+
+          for (var i = 0; i < cartesians.length; i++) {
+            if (isIntervalOrLogScale(cartesians[i].getOtherAxis(axisModel.axis).scale)) {
+              // Still show axis tick or axisLine if other axis is value / log
+              return true;
+            }
+          } // Not show axisTick or axisLine if other axis is category / time
+
+
+          return false;
+        }
+      }, layout));
+      each(axisBuilderAttrs, axisBuilder.add, axisBuilder);
+
+      this._axisGroup.add(axisBuilder.getGroup());
+
+      each(selfBuilderAttrs, function (name) {
+        if (axisModel.get([name, 'show'])) {
+          axisElementBuilders[name](this, this._axisGroup, axisModel, gridModel);
+        }
+      }, this); // THIS is a special case for bar racing chart.
+      // Update the axis label from the natural initial layout to
+      // sorted layout should has no animation.
+
+      var isInitialSortFromBarRacing = payload && payload.type === 'changeAxisOrder' && payload.isInitSort;
+
+      if (!isInitialSortFromBarRacing) {
+        groupTransition(oldAxisGroup, this._axisGroup, axisModel);
+      }
+
+      _super.prototype.render.call(this, axisModel, ecModel, api, payload);
+    };
+
+    CartesianAxisView.prototype.remove = function () {
+      rectCoordAxisHandleRemove(this);
+    };
+
+    CartesianAxisView.type = 'cartesianAxis';
+    return CartesianAxisView;
+  }(AxisView);
+
+  var axisElementBuilders = {
+    splitLine: function (axisView, axisGroup, axisModel, gridModel) {
+      var axis = axisModel.axis;
+
+      if (axis.scale.isBlank()) {
+        return;
+      }
+
+      var splitLineModel = axisModel.getModel('splitLine');
+      var lineStyleModel = splitLineModel.getModel('lineStyle');
+      var lineColors = lineStyleModel.get('color');
+      lineColors = isArray(lineColors) ? lineColors : [lineColors];
+      var gridRect = gridModel.coordinateSystem.getRect();
+      var isHorizontal = axis.isHorizontal();
+      var lineCount = 0;
+      var ticksCoords = axis.getTicksCoords({
+        tickModel: splitLineModel
+      });
+      var p1 = [];
+      var p2 = [];
+      var lineStyle = lineStyleModel.getLineStyle();
+
+      for (var i = 0; i < ticksCoords.length; i++) {
+        var tickCoord = axis.toGlobalCoord(ticksCoords[i].coord);
+
+        if (isHorizontal) {
+          p1[0] = tickCoord;
+          p1[1] = gridRect.y;
+          p2[0] = tickCoord;
+          p2[1] = gridRect.y + gridRect.height;
+        } else {
+          p1[0] = gridRect.x;
+          p1[1] = tickCoord;
+          p2[0] = gridRect.x + gridRect.width;
+          p2[1] = tickCoord;
+        }
+
+        var colorIndex = lineCount++ % lineColors.length;
+        var tickValue = ticksCoords[i].tickValue;
+        var line = new Line({
+          anid: tickValue != null ? 'line_' + ticksCoords[i].tickValue : null,
+          autoBatch: true,
+          shape: {
+            x1: p1[0],
+            y1: p1[1],
+            x2: p2[0],
+            y2: p2[1]
+          },
+          style: defaults({
+            stroke: lineColors[colorIndex]
+          }, lineStyle),
+          silent: true
+        });
+        subPixelOptimizeLine$1(line.shape, lineStyle.lineWidth);
+        axisGroup.add(line);
+      }
+    },
+    minorSplitLine: function (axisView, axisGroup, axisModel, gridModel) {
+      var axis = axisModel.axis;
+      var minorSplitLineModel = axisModel.getModel('minorSplitLine');
+      var lineStyleModel = minorSplitLineModel.getModel('lineStyle');
+      var gridRect = gridModel.coordinateSystem.getRect();
+      var isHorizontal = axis.isHorizontal();
+      var minorTicksCoords = axis.getMinorTicksCoords();
+
+      if (!minorTicksCoords.length) {
+        return;
+      }
+
+      var p1 = [];
+      var p2 = [];
+      var lineStyle = lineStyleModel.getLineStyle();
+
+      for (var i = 0; i < minorTicksCoords.length; i++) {
+        for (var k = 0; k < minorTicksCoords[i].length; k++) {
+          var tickCoord = axis.toGlobalCoord(minorTicksCoords[i][k].coord);
+
+          if (isHorizontal) {
+            p1[0] = tickCoord;
+            p1[1] = gridRect.y;
+            p2[0] = tickCoord;
+            p2[1] = gridRect.y + gridRect.height;
+          } else {
+            p1[0] = gridRect.x;
+            p1[1] = tickCoord;
+            p2[0] = gridRect.x + gridRect.width;
+            p2[1] = tickCoord;
+          }
+
+          var line = new Line({
+            anid: 'minor_line_' + minorTicksCoords[i][k].tickValue,
+            autoBatch: true,
+            shape: {
+              x1: p1[0],
+              y1: p1[1],
+              x2: p2[0],
+              y2: p2[1]
+            },
+            style: lineStyle,
+            silent: true
+          });
+          subPixelOptimizeLine$1(line.shape, lineStyle.lineWidth);
+          axisGroup.add(line);
+        }
+      }
+    },
+    splitArea: function (axisView, axisGroup, axisModel, gridModel) {
+      rectCoordAxisBuildSplitArea(axisView, axisGroup, axisModel, gridModel);
+    }
+  };
+
+  var CartesianXAxisView =
+  /** @class */
+  function (_super) {
+    __extends(CartesianXAxisView, _super);
+
+    function CartesianXAxisView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = CartesianXAxisView.type;
+      return _this;
+    }
+
+    CartesianXAxisView.type = 'xAxis';
+    return CartesianXAxisView;
+  }(CartesianAxisView);
+
+  var CartesianYAxisView =
+  /** @class */
+  function (_super) {
+    __extends(CartesianYAxisView, _super);
+
+    function CartesianYAxisView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = CartesianXAxisView.type;
+      return _this;
+    }
+
+    CartesianYAxisView.type = 'yAxis';
+    return CartesianYAxisView;
+  }(CartesianAxisView);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var GridView =
+  /** @class */
+  function (_super) {
+    __extends(GridView, _super);
+
+    function GridView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = 'grid';
+      return _this;
+    }
+
+    GridView.prototype.render = function (gridModel, ecModel) {
+      this.group.removeAll();
+
+      if (gridModel.get('show')) {
+        this.group.add(new Rect({
+          shape: gridModel.coordinateSystem.getRect(),
+          style: defaults({
+            fill: gridModel.get('backgroundColor')
+          }, gridModel.getItemStyle()),
+          silent: true,
+          z2: -1
+        }));
+      }
+    };
+
+    GridView.type = 'grid';
+    return GridView;
+  }(ComponentView);
+
+  var extraOption = {
+    // gridIndex: 0,
+    // gridId: '',
+    offset: 0
+  };
+
+  function install$4(registers) {
+    registers.registerComponentView(GridView);
+    registers.registerComponentModel(GridModel);
+    registers.registerCoordinateSystem('cartesian2d', Grid);
+    axisModelCreator(registers, 'x', CartesianAxisModel, extraOption);
+    axisModelCreator(registers, 'y', CartesianAxisModel, extraOption);
+    registers.registerComponentView(CartesianXAxisView);
+    registers.registerComponentView(CartesianYAxisView);
+    registers.registerPreprocessor(function (option) {
+      // Only create grid when need
+      if (option.xAxis && option.yAxis && !option.grid) {
+        option.grid = {};
+      }
+    });
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  use(install$4);
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -46824,7 +53592,7 @@
   */
 
 
-  function install$3(registers) {
+  function install$5(registers) {
     registers.registerComponentModel(CalendarModel);
     registers.registerComponentView(CalendarView);
     registers.registerCoordinateSystem('calendar', Calendar);
@@ -46872,7 +53640,7 @@
   */
 
 
-  use(install$3);
+  use(install$5);
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -47107,7 +53875,7 @@
     return TitleView;
   }(ComponentView);
 
-  function install$4(registers) {
+  function install$6(registers) {
     registers.registerComponentModel(TitleModel);
     registers.registerComponentView(TitleView);
   }
@@ -47154,329 +53922,7 @@
   */
 
 
-  use(install$4);
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-  // allAxesInfo should be updated when setOption performed.
-
-  function collect(ecModel, api) {
-    var result = {
-      /**
-       * key: makeKey(axis.model)
-       * value: {
-       *      axis,
-       *      coordSys,
-       *      axisPointerModel,
-       *      triggerTooltip,
-       *      involveSeries,
-       *      snap,
-       *      seriesModels,
-       *      seriesDataCount
-       * }
-       */
-      axesInfo: {},
-      seriesInvolved: false,
-
-      /**
-       * key: makeKey(coordSys.model)
-       * value: Object: key makeKey(axis.model), value: axisInfo
-       */
-      coordSysAxesInfo: {},
-      coordSysMap: {}
-    };
-    collectAxesInfo(result, ecModel, api); // Check seriesInvolved for performance, in case too many series in some chart.
-
-    result.seriesInvolved && collectSeriesInfo(result, ecModel);
-    return result;
-  }
-
-  function collectAxesInfo(result, ecModel, api) {
-    var globalTooltipModel = ecModel.getComponent('tooltip');
-    var globalAxisPointerModel = ecModel.getComponent('axisPointer'); // links can only be set on global.
-
-    var linksOption = globalAxisPointerModel.get('link', true) || [];
-    var linkGroups = []; // Collect axes info.
-
-    each(api.getCoordinateSystems(), function (coordSys) {
-      // Some coordinate system do not support axes, like geo.
-      if (!coordSys.axisPointerEnabled) {
-        return;
-      }
-
-      var coordSysKey = makeKey(coordSys.model);
-      var axesInfoInCoordSys = result.coordSysAxesInfo[coordSysKey] = {};
-      result.coordSysMap[coordSysKey] = coordSys; // Set tooltip (like 'cross') is a convienent way to show axisPointer
-      // for user. So we enable seting tooltip on coordSys model.
-
-      var coordSysModel = coordSys.model;
-      var baseTooltipModel = coordSysModel.getModel('tooltip', globalTooltipModel);
-      each(coordSys.getAxes(), curry(saveTooltipAxisInfo, false, null)); // If axis tooltip used, choose tooltip axis for each coordSys.
-      // Notice this case: coordSys is `grid` but not `cartesian2D` here.
-
-      if (coordSys.getTooltipAxes && globalTooltipModel // If tooltip.showContent is set as false, tooltip will not
-      // show but axisPointer will show as normal.
-      && baseTooltipModel.get('show')) {
-        // Compatible with previous logic. But series.tooltip.trigger: 'axis'
-        // or series.data[n].tooltip.trigger: 'axis' are not support any more.
-        var triggerAxis = baseTooltipModel.get('trigger') === 'axis';
-        var cross = baseTooltipModel.get(['axisPointer', 'type']) === 'cross';
-        var tooltipAxes = coordSys.getTooltipAxes(baseTooltipModel.get(['axisPointer', 'axis']));
-
-        if (triggerAxis || cross) {
-          each(tooltipAxes.baseAxes, curry(saveTooltipAxisInfo, cross ? 'cross' : true, triggerAxis));
-        }
-
-        if (cross) {
-          each(tooltipAxes.otherAxes, curry(saveTooltipAxisInfo, 'cross', false));
-        }
-      } // fromTooltip: true | false | 'cross'
-      // triggerTooltip: true | false | null
-
-
-      function saveTooltipAxisInfo(fromTooltip, triggerTooltip, axis) {
-        var axisPointerModel = axis.model.getModel('axisPointer', globalAxisPointerModel);
-        var axisPointerShow = axisPointerModel.get('show');
-
-        if (!axisPointerShow || axisPointerShow === 'auto' && !fromTooltip && !isHandleTrigger(axisPointerModel)) {
-          return;
-        }
-
-        if (triggerTooltip == null) {
-          triggerTooltip = axisPointerModel.get('triggerTooltip');
-        }
-
-        axisPointerModel = fromTooltip ? makeAxisPointerModel(axis, baseTooltipModel, globalAxisPointerModel, ecModel, fromTooltip, triggerTooltip) : axisPointerModel;
-        var snap = axisPointerModel.get('snap');
-        var axisKey = makeKey(axis.model);
-        var involveSeries = triggerTooltip || snap || axis.type === 'category'; // If result.axesInfo[key] exist, override it (tooltip has higher priority).
-
-        var axisInfo = result.axesInfo[axisKey] = {
-          key: axisKey,
-          axis: axis,
-          coordSys: coordSys,
-          axisPointerModel: axisPointerModel,
-          triggerTooltip: triggerTooltip,
-          involveSeries: involveSeries,
-          snap: snap,
-          useHandle: isHandleTrigger(axisPointerModel),
-          seriesModels: [],
-          linkGroup: null
-        };
-        axesInfoInCoordSys[axisKey] = axisInfo;
-        result.seriesInvolved = result.seriesInvolved || involveSeries;
-        var groupIndex = getLinkGroupIndex(linksOption, axis);
-
-        if (groupIndex != null) {
-          var linkGroup = linkGroups[groupIndex] || (linkGroups[groupIndex] = {
-            axesInfo: {}
-          });
-          linkGroup.axesInfo[axisKey] = axisInfo;
-          linkGroup.mapper = linksOption[groupIndex].mapper;
-          axisInfo.linkGroup = linkGroup;
-        }
-      }
-    });
-  }
-
-  function makeAxisPointerModel(axis, baseTooltipModel, globalAxisPointerModel, ecModel, fromTooltip, triggerTooltip) {
-    var tooltipAxisPointerModel = baseTooltipModel.getModel('axisPointer');
-    var fields = ['type', 'snap', 'lineStyle', 'shadowStyle', 'label', 'animation', 'animationDurationUpdate', 'animationEasingUpdate', 'z'];
-    var volatileOption = {};
-    each(fields, function (field) {
-      volatileOption[field] = clone(tooltipAxisPointerModel.get(field));
-    }); // category axis do not auto snap, otherwise some tick that do not
-    // has value can not be hovered. value/time/log axis default snap if
-    // triggered from tooltip and trigger tooltip.
-
-    volatileOption.snap = axis.type !== 'category' && !!triggerTooltip; // Compatibel with previous behavior, tooltip axis do not show label by default.
-    // Only these properties can be overrided from tooltip to axisPointer.
-
-    if (tooltipAxisPointerModel.get('type') === 'cross') {
-      volatileOption.type = 'line';
-    }
-
-    var labelOption = volatileOption.label || (volatileOption.label = {}); // Follow the convention, do not show label when triggered by tooltip by default.
-
-    labelOption.show == null && (labelOption.show = false);
-
-    if (fromTooltip === 'cross') {
-      // When 'cross', both axes show labels.
-      var tooltipAxisPointerLabelShow = tooltipAxisPointerModel.get(['label', 'show']);
-      labelOption.show = tooltipAxisPointerLabelShow != null ? tooltipAxisPointerLabelShow : true; // If triggerTooltip, this is a base axis, which should better not use cross style
-      // (cross style is dashed by default)
-
-      if (!triggerTooltip) {
-        var crossStyle = volatileOption.lineStyle = tooltipAxisPointerModel.get('crossStyle');
-        crossStyle && defaults(labelOption, crossStyle.textStyle);
-      }
-    }
-
-    return axis.model.getModel('axisPointer', new Model(volatileOption, globalAxisPointerModel, ecModel));
-  }
-
-  function collectSeriesInfo(result, ecModel) {
-    // Prepare data for axis trigger
-    ecModel.eachSeries(function (seriesModel) {
-      // Notice this case: this coordSys is `cartesian2D` but not `grid`.
-      var coordSys = seriesModel.coordinateSystem;
-      var seriesTooltipTrigger = seriesModel.get(['tooltip', 'trigger'], true);
-      var seriesTooltipShow = seriesModel.get(['tooltip', 'show'], true);
-
-      if (!coordSys || seriesTooltipTrigger === 'none' || seriesTooltipTrigger === false || seriesTooltipTrigger === 'item' || seriesTooltipShow === false || seriesModel.get(['axisPointer', 'show'], true) === false) {
-        return;
-      }
-
-      each(result.coordSysAxesInfo[makeKey(coordSys.model)], function (axisInfo) {
-        var axis = axisInfo.axis;
-
-        if (coordSys.getAxis(axis.dim) === axis) {
-          axisInfo.seriesModels.push(seriesModel);
-          axisInfo.seriesDataCount == null && (axisInfo.seriesDataCount = 0);
-          axisInfo.seriesDataCount += seriesModel.getData().count();
-        }
-      });
-    });
-  }
-  /**
-   * For example:
-   * {
-   *     axisPointer: {
-   *         links: [{
-   *             xAxisIndex: [2, 4],
-   *             yAxisIndex: 'all'
-   *         }, {
-   *             xAxisId: ['a5', 'a7'],
-   *             xAxisName: 'xxx'
-   *         }]
-   *     }
-   * }
-   */
-
-
-  function getLinkGroupIndex(linksOption, axis) {
-    var axisModel = axis.model;
-    var dim = axis.dim;
-
-    for (var i = 0; i < linksOption.length; i++) {
-      var linkOption = linksOption[i] || {};
-
-      if (checkPropInLink(linkOption[dim + 'AxisId'], axisModel.id) || checkPropInLink(linkOption[dim + 'AxisIndex'], axisModel.componentIndex) || checkPropInLink(linkOption[dim + 'AxisName'], axisModel.name)) {
-        return i;
-      }
-    }
-  }
-
-  function checkPropInLink(linkPropValue, axisPropValue) {
-    return linkPropValue === 'all' || isArray(linkPropValue) && indexOf(linkPropValue, axisPropValue) >= 0 || linkPropValue === axisPropValue;
-  }
-
-  function fixValue(axisModel) {
-    var axisInfo = getAxisInfo(axisModel);
-
-    if (!axisInfo) {
-      return;
-    }
-
-    var axisPointerModel = axisInfo.axisPointerModel;
-    var scale = axisInfo.axis.scale;
-    var option = axisPointerModel.option;
-    var status = axisPointerModel.get('status');
-    var value = axisPointerModel.get('value'); // Parse init value for category and time axis.
-
-    if (value != null) {
-      value = scale.parse(value);
-    }
-
-    var useHandle = isHandleTrigger(axisPointerModel); // If `handle` used, `axisPointer` will always be displayed, so value
-    // and status should be initialized.
-
-    if (status == null) {
-      option.status = useHandle ? 'show' : 'hide';
-    }
-
-    var extent = scale.getExtent().slice();
-    extent[0] > extent[1] && extent.reverse();
-
-    if ( // Pick a value on axis when initializing.
-    value == null // If both `handle` and `dataZoom` are used, value may be out of axis extent,
-    // where we should re-pick a value to keep `handle` displaying normally.
-    || value > extent[1]) {
-      // Make handle displayed on the end of the axis when init, which looks better.
-      value = extent[1];
-    }
-
-    if (value < extent[0]) {
-      value = extent[0];
-    }
-
-    option.value = value;
-
-    if (useHandle) {
-      option.status = axisInfo.axis.scale.isBlank() ? 'hide' : 'show';
-    }
-  }
-
-  function getAxisInfo(axisModel) {
-    var coordSysAxesInfo = (axisModel.ecModel.getComponent('axisPointer') || {}).coordSysAxesInfo;
-    return coordSysAxesInfo && coordSysAxesInfo.axesInfo[makeKey(axisModel)];
-  }
-
-  function getAxisPointerModel(axisModel) {
-    var axisInfo = getAxisInfo(axisModel);
-    return axisInfo && axisInfo.axisPointerModel;
-  }
-
-  function isHandleTrigger(axisPointerModel) {
-    return !!axisPointerModel.get(['handle', 'show']);
-  }
-  /**
-   * @param {module:echarts/model/Model} model
-   * @return {string} unique key
-   */
-
-
-  function makeKey(model) {
-    return model.type + '||' + model.id;
-  }
+  use(install$6);
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -47519,144 +53965,7 @@
   * under the License.
   */
 
-
-  var axisPointerClazz = {};
-  /**
-   * Base class of AxisView.
-   */
-
-  var AxisView =
-  /** @class */
-  function (_super) {
-    __extends(AxisView, _super);
-
-    function AxisView() {
-      var _this = _super !== null && _super.apply(this, arguments) || this;
-
-      _this.type = AxisView.type;
-      return _this;
-    }
-    /**
-     * @override
-     */
-
-
-    AxisView.prototype.render = function (axisModel, ecModel, api, payload) {
-      // FIXME
-      // This process should proformed after coordinate systems updated
-      // (axis scale updated), and should be performed each time update.
-      // So put it here temporarily, although it is not appropriate to
-      // put a model-writing procedure in `view`.
-      this.axisPointerClass && fixValue(axisModel);
-
-      _super.prototype.render.apply(this, arguments);
-
-      this._doUpdateAxisPointerClass(axisModel, api, true);
-    };
-    /**
-     * Action handler.
-     */
-
-
-    AxisView.prototype.updateAxisPointer = function (axisModel, ecModel, api, payload) {
-      this._doUpdateAxisPointerClass(axisModel, api, false);
-    };
-    /**
-     * @override
-     */
-
-
-    AxisView.prototype.remove = function (ecModel, api) {
-      var axisPointer = this._axisPointer;
-      axisPointer && axisPointer.remove(api);
-    };
-    /**
-     * @override
-     */
-
-
-    AxisView.prototype.dispose = function (ecModel, api) {
-      this._disposeAxisPointer(api);
-
-      _super.prototype.dispose.apply(this, arguments);
-    };
-
-    AxisView.prototype._doUpdateAxisPointerClass = function (axisModel, api, forceRender) {
-      var Clazz = AxisView.getAxisPointerClass(this.axisPointerClass);
-
-      if (!Clazz) {
-        return;
-      }
-
-      var axisPointerModel = getAxisPointerModel(axisModel);
-      axisPointerModel ? (this._axisPointer || (this._axisPointer = new Clazz())).render(axisModel, axisPointerModel, api, forceRender) : this._disposeAxisPointer(api);
-    };
-
-    AxisView.prototype._disposeAxisPointer = function (api) {
-      this._axisPointer && this._axisPointer.dispose(api);
-      this._axisPointer = null;
-    };
-
-    AxisView.registerAxisPointerClass = function (type, clazz) {
-      {
-        if (axisPointerClazz[type]) {
-          throw new Error('axisPointer ' + type + ' exists');
-        }
-      }
-      axisPointerClazz[type] = clazz;
-    };
-
-    AxisView.getAxisPointerClass = function (type) {
-      return type && axisPointerClazz[type];
-    };
-
-    AxisView.type = 'axis';
-    return AxisView;
-  }(ComponentView);
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  var inner$6 = makeInner();
+  var inner$7 = makeInner();
   var clone$3 = clone;
   var bind$1 = bind;
   /**
@@ -47807,7 +54116,7 @@
       var pointerOption = elOption.pointer;
 
       if (pointerOption) {
-        var pointerEl = inner$6(group).pointerEl = new graphic[pointerOption.type](clone$3(elOption.pointer));
+        var pointerEl = inner$7(group).pointerEl = new graphic[pointerOption.type](clone$3(elOption.pointer));
         group.add(pointerEl);
       }
     };
@@ -47818,7 +54127,7 @@
 
     BaseAxisPointer.prototype.createLabelEl = function (group, elOption, axisModel, axisPointerModel) {
       if (elOption.label) {
-        var labelEl = inner$6(group).labelEl = new ZRText(clone$3(elOption.label));
+        var labelEl = inner$7(group).labelEl = new ZRText(clone$3(elOption.label));
         group.add(labelEl);
         updateLabelShowHide(labelEl, axisPointerModel);
       }
@@ -47829,7 +54138,7 @@
 
 
     BaseAxisPointer.prototype.updatePointerEl = function (group, elOption, updateProps$$1) {
-      var pointerEl = inner$6(group).pointerEl;
+      var pointerEl = inner$7(group).pointerEl;
 
       if (pointerEl && elOption.pointer) {
         pointerEl.setStyle(elOption.pointer.style);
@@ -47844,7 +54153,7 @@
 
 
     BaseAxisPointer.prototype.updateLabelEl = function (group, elOption, updateProps$$1, axisPointerModel) {
-      var labelEl = inner$6(group).labelEl;
+      var labelEl = inner$7(group).labelEl;
 
       if (labelEl) {
         labelEl.setStyle(elOption.label.style);
@@ -47935,7 +54244,7 @@
       this._payloadInfo = trans;
       handle.stopAnimation();
       handle.attr(getHandleTransProps(trans));
-      inner$6(handle).lastProp = null;
+      inner$7(handle).lastProp = null;
 
       this._doDispatchAxisPointer();
     };
@@ -48033,8 +54342,8 @@
 
   function updateProps$1(animationModel, moveAnimation, el, props) {
     // Animation optimize.
-    if (!propsEqual(inner$6(el).lastProp, props)) {
-      inner$6(el).lastProp = props;
+    if (!propsEqual(inner$7(el).lastProp, props)) {
+      inner$7(el).lastProp = props;
       moveAnimation ? updateProps(el, props, animationModel) : (el.stopAnimation(), el.attr(props));
     }
   }
@@ -48073,628 +54382,6 @@
         el.silent = silent;
       }
     });
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  var PI$4 = Math.PI;
-  /**
-   * A final axis is translated and rotated from a "standard axis".
-   * So opt.position and opt.rotation is required.
-   *
-   * A standard axis is and axis from [0, 0] to [0, axisExtent[1]],
-   * for example: (0, 0) ------------> (0, 50)
-   *
-   * nameDirection or tickDirection or labelDirection is 1 means tick
-   * or label is below the standard axis, whereas is -1 means above
-   * the standard axis. labelOffset means offset between label and axis,
-   * which is useful when 'onZero', where axisLabel is in the grid and
-   * label in outside grid.
-   *
-   * Tips: like always,
-   * positive rotation represents anticlockwise, and negative rotation
-   * represents clockwise.
-   * The direction of position coordinate is the same as the direction
-   * of screen coordinate.
-   *
-   * Do not need to consider axis 'inverse', which is auto processed by
-   * axis extent.
-   */
-
-  var AxisBuilder =
-  /** @class */
-  function () {
-    function AxisBuilder(axisModel, opt) {
-      this.group = new Group();
-      this.opt = opt;
-      this.axisModel = axisModel; // Default value
-
-      defaults(opt, {
-        labelOffset: 0,
-        nameDirection: 1,
-        tickDirection: 1,
-        labelDirection: 1,
-        silent: true,
-        handleAutoShown: function () {
-          return true;
-        }
-      }); // FIXME Not use a seperate text group?
-
-      var transformGroup = new Group({
-        x: opt.position[0],
-        y: opt.position[1],
-        rotation: opt.rotation
-      }); // this.group.add(transformGroup);
-      // this._transformGroup = transformGroup;
-
-      transformGroup.updateTransform();
-      this._transformGroup = transformGroup;
-    }
-
-    AxisBuilder.prototype.hasBuilder = function (name) {
-      return !!builders[name];
-    };
-
-    AxisBuilder.prototype.add = function (name) {
-      builders[name](this.opt, this.axisModel, this.group, this._transformGroup);
-    };
-
-    AxisBuilder.prototype.getGroup = function () {
-      return this.group;
-    };
-
-    AxisBuilder.innerTextLayout = function (axisRotation, textRotation, direction) {
-      var rotationDiff = remRadian(textRotation - axisRotation);
-      var textAlign;
-      var textVerticalAlign;
-
-      if (isRadianAroundZero(rotationDiff)) {
-        // Label is parallel with axis line.
-        textVerticalAlign = direction > 0 ? 'top' : 'bottom';
-        textAlign = 'center';
-      } else if (isRadianAroundZero(rotationDiff - PI$4)) {
-        // Label is inverse parallel with axis line.
-        textVerticalAlign = direction > 0 ? 'bottom' : 'top';
-        textAlign = 'center';
-      } else {
-        textVerticalAlign = 'middle';
-
-        if (rotationDiff > 0 && rotationDiff < PI$4) {
-          textAlign = direction > 0 ? 'right' : 'left';
-        } else {
-          textAlign = direction > 0 ? 'left' : 'right';
-        }
-      }
-
-      return {
-        rotation: rotationDiff,
-        textAlign: textAlign,
-        textVerticalAlign: textVerticalAlign
-      };
-    };
-
-    AxisBuilder.makeAxisEventDataBase = function (axisModel) {
-      var eventData = {
-        componentType: axisModel.mainType,
-        componentIndex: axisModel.componentIndex
-      };
-      eventData[axisModel.mainType + 'Index'] = axisModel.componentIndex;
-      return eventData;
-    };
-
-    AxisBuilder.isLabelSilent = function (axisModel) {
-      var tooltipOpt = axisModel.get('tooltip');
-      return axisModel.get('silent') // Consider mouse cursor, add these restrictions.
-      || !(axisModel.get('triggerEvent') || tooltipOpt && tooltipOpt.show);
-    };
-
-    return AxisBuilder;
-  }();
-
-  var builders = {
-    axisLine: function (opt, axisModel, group, transformGroup) {
-      var shown = axisModel.get(['axisLine', 'show']);
-
-      if (shown === 'auto' && opt.handleAutoShown) {
-        shown = opt.handleAutoShown('axisLine');
-      }
-
-      if (!shown) {
-        return;
-      }
-
-      var extent = axisModel.axis.getExtent();
-      var matrix = transformGroup.transform;
-      var pt1 = [extent[0], 0];
-      var pt2 = [extent[1], 0];
-      var inverse = pt1[0] > pt2[0];
-
-      if (matrix) {
-        applyTransform(pt1, pt1, matrix);
-        applyTransform(pt2, pt2, matrix);
-      }
-
-      var lineStyle = extend({
-        lineCap: 'round'
-      }, axisModel.getModel(['axisLine', 'lineStyle']).getLineStyle());
-      var line = new Line({
-        shape: {
-          x1: pt1[0],
-          y1: pt1[1],
-          x2: pt2[0],
-          y2: pt2[1]
-        },
-        style: lineStyle,
-        strokeContainThreshold: opt.strokeContainThreshold || 5,
-        silent: true,
-        z2: 1
-      });
-      subPixelOptimizeLine$1(line.shape, line.style.lineWidth);
-      line.anid = 'line';
-      group.add(line);
-      var arrows = axisModel.get(['axisLine', 'symbol']);
-
-      if (arrows != null) {
-        var arrowSize = axisModel.get(['axisLine', 'symbolSize']);
-
-        if (isString(arrows)) {
-          // Use the same arrow for start and end point
-          arrows = [arrows, arrows];
-        }
-
-        if (isString(arrowSize) || isNumber(arrowSize)) {
-          // Use the same size for width and height
-          arrowSize = [arrowSize, arrowSize];
-        }
-
-        var arrowOffset = normalizeSymbolOffset(axisModel.get(['axisLine', 'symbolOffset']) || 0, arrowSize);
-        var symbolWidth_1 = arrowSize[0];
-        var symbolHeight_1 = arrowSize[1];
-        each([{
-          rotate: opt.rotation + Math.PI / 2,
-          offset: arrowOffset[0],
-          r: 0
-        }, {
-          rotate: opt.rotation - Math.PI / 2,
-          offset: arrowOffset[1],
-          r: Math.sqrt((pt1[0] - pt2[0]) * (pt1[0] - pt2[0]) + (pt1[1] - pt2[1]) * (pt1[1] - pt2[1]))
-        }], function (point, index) {
-          if (arrows[index] !== 'none' && arrows[index] != null) {
-            var symbol = createSymbol(arrows[index], -symbolWidth_1 / 2, -symbolHeight_1 / 2, symbolWidth_1, symbolHeight_1, lineStyle.stroke, true); // Calculate arrow position with offset
-
-            var r = point.r + point.offset;
-            var pt = inverse ? pt2 : pt1;
-            symbol.attr({
-              rotation: point.rotate,
-              x: pt[0] + r * Math.cos(opt.rotation),
-              y: pt[1] - r * Math.sin(opt.rotation),
-              silent: true,
-              z2: 11
-            });
-            group.add(symbol);
-          }
-        });
-      }
-    },
-    axisTickLabel: function (opt, axisModel, group, transformGroup) {
-      var ticksEls = buildAxisMajorTicks(group, transformGroup, axisModel, opt);
-      var labelEls = buildAxisLabel(group, transformGroup, axisModel, opt);
-      fixMinMaxLabelShow(axisModel, labelEls, ticksEls);
-      buildAxisMinorTicks(group, transformGroup, axisModel, opt.tickDirection); // This bit fixes the label overlap issue for the time chart.
-      // See https://github.com/apache/echarts/issues/14266 for more.
-
-      if (axisModel.get(['axisLabel', 'hideOverlap'])) {
-        var labelList = prepareLayoutList(map(labelEls, function (label) {
-          return {
-            label: label,
-            priority: label.z2,
-            defaultAttr: {
-              ignore: label.ignore
-            }
-          };
-        }));
-        hideOverlap(labelList);
-      }
-    },
-    axisName: function (opt, axisModel, group, transformGroup) {
-      var name = retrieve(opt.axisName, axisModel.get('name'));
-
-      if (!name) {
-        return;
-      }
-
-      var nameLocation = axisModel.get('nameLocation');
-      var nameDirection = opt.nameDirection;
-      var textStyleModel = axisModel.getModel('nameTextStyle');
-      var gap = axisModel.get('nameGap') || 0;
-      var extent = axisModel.axis.getExtent();
-      var gapSignal = extent[0] > extent[1] ? -1 : 1;
-      var pos = [nameLocation === 'start' ? extent[0] - gapSignal * gap : nameLocation === 'end' ? extent[1] + gapSignal * gap : (extent[0] + extent[1]) / 2, // Reuse labelOffset.
-      isNameLocationCenter(nameLocation) ? opt.labelOffset + nameDirection * gap : 0];
-      var labelLayout;
-      var nameRotation = axisModel.get('nameRotate');
-
-      if (nameRotation != null) {
-        nameRotation = nameRotation * PI$4 / 180; // To radian.
-      }
-
-      var axisNameAvailableWidth;
-
-      if (isNameLocationCenter(nameLocation)) {
-        labelLayout = AxisBuilder.innerTextLayout(opt.rotation, nameRotation != null ? nameRotation : opt.rotation, // Adapt to axis.
-        nameDirection);
-      } else {
-        labelLayout = endTextLayout(opt.rotation, nameLocation, nameRotation || 0, extent);
-        axisNameAvailableWidth = opt.axisNameAvailableWidth;
-
-        if (axisNameAvailableWidth != null) {
-          axisNameAvailableWidth = Math.abs(axisNameAvailableWidth / Math.sin(labelLayout.rotation));
-          !isFinite(axisNameAvailableWidth) && (axisNameAvailableWidth = null);
-        }
-      }
-
-      var textFont = textStyleModel.getFont();
-      var truncateOpt = axisModel.get('nameTruncate', true) || {};
-      var ellipsis = truncateOpt.ellipsis;
-      var maxWidth = retrieve(opt.nameTruncateMaxWidth, truncateOpt.maxWidth, axisNameAvailableWidth);
-      var textEl = new ZRText({
-        x: pos[0],
-        y: pos[1],
-        rotation: labelLayout.rotation,
-        silent: AxisBuilder.isLabelSilent(axisModel),
-        style: createTextStyle(textStyleModel, {
-          text: name,
-          font: textFont,
-          overflow: 'truncate',
-          width: maxWidth,
-          ellipsis: ellipsis,
-          fill: textStyleModel.getTextColor() || axisModel.get(['axisLine', 'lineStyle', 'color']),
-          align: textStyleModel.get('align') || labelLayout.textAlign,
-          verticalAlign: textStyleModel.get('verticalAlign') || labelLayout.textVerticalAlign
-        }),
-        z2: 1
-      });
-      setTooltipConfig({
-        el: textEl,
-        componentModel: axisModel,
-        itemName: name
-      });
-      textEl.__fullText = name; // Id for animation
-
-      textEl.anid = 'name';
-
-      if (axisModel.get('triggerEvent')) {
-        var eventData = AxisBuilder.makeAxisEventDataBase(axisModel);
-        eventData.targetType = 'axisName';
-        eventData.name = name;
-        getECData(textEl).eventData = eventData;
-      } // FIXME
-
-
-      transformGroup.add(textEl);
-      textEl.updateTransform();
-      group.add(textEl);
-      textEl.decomposeTransform();
-    }
-  };
-
-  function endTextLayout(rotation, textPosition, textRotate, extent) {
-    var rotationDiff = remRadian(textRotate - rotation);
-    var textAlign;
-    var textVerticalAlign;
-    var inverse = extent[0] > extent[1];
-    var onLeft = textPosition === 'start' && !inverse || textPosition !== 'start' && inverse;
-
-    if (isRadianAroundZero(rotationDiff - PI$4 / 2)) {
-      textVerticalAlign = onLeft ? 'bottom' : 'top';
-      textAlign = 'center';
-    } else if (isRadianAroundZero(rotationDiff - PI$4 * 1.5)) {
-      textVerticalAlign = onLeft ? 'top' : 'bottom';
-      textAlign = 'center';
-    } else {
-      textVerticalAlign = 'middle';
-
-      if (rotationDiff < PI$4 * 1.5 && rotationDiff > PI$4 / 2) {
-        textAlign = onLeft ? 'left' : 'right';
-      } else {
-        textAlign = onLeft ? 'right' : 'left';
-      }
-    }
-
-    return {
-      rotation: rotationDiff,
-      textAlign: textAlign,
-      textVerticalAlign: textVerticalAlign
-    };
-  }
-
-  function fixMinMaxLabelShow(axisModel, labelEls, tickEls) {
-    if (shouldShowAllLabels(axisModel.axis)) {
-      return;
-    } // If min or max are user set, we need to check
-    // If the tick on min(max) are overlap on their neighbour tick
-    // If they are overlapped, we need to hide the min(max) tick label
-
-
-    var showMinLabel = axisModel.get(['axisLabel', 'showMinLabel']);
-    var showMaxLabel = axisModel.get(['axisLabel', 'showMaxLabel']); // FIXME
-    // Have not consider onBand yet, where tick els is more than label els.
-
-    labelEls = labelEls || [];
-    tickEls = tickEls || [];
-    var firstLabel = labelEls[0];
-    var nextLabel = labelEls[1];
-    var lastLabel = labelEls[labelEls.length - 1];
-    var prevLabel = labelEls[labelEls.length - 2];
-    var firstTick = tickEls[0];
-    var nextTick = tickEls[1];
-    var lastTick = tickEls[tickEls.length - 1];
-    var prevTick = tickEls[tickEls.length - 2];
-
-    if (showMinLabel === false) {
-      ignoreEl(firstLabel);
-      ignoreEl(firstTick);
-    } else if (isTwoLabelOverlapped(firstLabel, nextLabel)) {
-      if (showMinLabel) {
-        ignoreEl(nextLabel);
-        ignoreEl(nextTick);
-      } else {
-        ignoreEl(firstLabel);
-        ignoreEl(firstTick);
-      }
-    }
-
-    if (showMaxLabel === false) {
-      ignoreEl(lastLabel);
-      ignoreEl(lastTick);
-    } else if (isTwoLabelOverlapped(prevLabel, lastLabel)) {
-      if (showMaxLabel) {
-        ignoreEl(prevLabel);
-        ignoreEl(prevTick);
-      } else {
-        ignoreEl(lastLabel);
-        ignoreEl(lastTick);
-      }
-    }
-  }
-
-  function ignoreEl(el) {
-    el && (el.ignore = true);
-  }
-
-  function isTwoLabelOverlapped(current, next) {
-    // current and next has the same rotation.
-    var firstRect = current && current.getBoundingRect().clone();
-    var nextRect = next && next.getBoundingRect().clone();
-
-    if (!firstRect || !nextRect) {
-      return;
-    } // When checking intersect of two rotated labels, we use mRotationBack
-    // to avoid that boundingRect is enlarge when using `boundingRect.applyTransform`.
-
-
-    var mRotationBack = identity([]);
-    rotate(mRotationBack, mRotationBack, -current.rotation);
-    firstRect.applyTransform(mul$1([], mRotationBack, current.getLocalTransform()));
-    nextRect.applyTransform(mul$1([], mRotationBack, next.getLocalTransform()));
-    return firstRect.intersect(nextRect);
-  }
-
-  function isNameLocationCenter(nameLocation) {
-    return nameLocation === 'middle' || nameLocation === 'center';
-  }
-
-  function createTicks(ticksCoords, tickTransform, tickEndCoord, tickLineStyle, anidPrefix) {
-    var tickEls = [];
-    var pt1 = [];
-    var pt2 = [];
-
-    for (var i = 0; i < ticksCoords.length; i++) {
-      var tickCoord = ticksCoords[i].coord;
-      pt1[0] = tickCoord;
-      pt1[1] = 0;
-      pt2[0] = tickCoord;
-      pt2[1] = tickEndCoord;
-
-      if (tickTransform) {
-        applyTransform(pt1, pt1, tickTransform);
-        applyTransform(pt2, pt2, tickTransform);
-      } // Tick line, Not use group transform to have better line draw
-
-
-      var tickEl = new Line({
-        shape: {
-          x1: pt1[0],
-          y1: pt1[1],
-          x2: pt2[0],
-          y2: pt2[1]
-        },
-        style: tickLineStyle,
-        z2: 2,
-        autoBatch: true,
-        silent: true
-      });
-      subPixelOptimizeLine$1(tickEl.shape, tickEl.style.lineWidth);
-      tickEl.anid = anidPrefix + '_' + ticksCoords[i].tickValue;
-      tickEls.push(tickEl);
-    }
-
-    return tickEls;
-  }
-
-  function buildAxisMajorTicks(group, transformGroup, axisModel, opt) {
-    var axis = axisModel.axis;
-    var tickModel = axisModel.getModel('axisTick');
-    var shown = tickModel.get('show');
-
-    if (shown === 'auto' && opt.handleAutoShown) {
-      shown = opt.handleAutoShown('axisTick');
-    }
-
-    if (!shown || axis.scale.isBlank()) {
-      return;
-    }
-
-    var lineStyleModel = tickModel.getModel('lineStyle');
-    var tickEndCoord = opt.tickDirection * tickModel.get('length');
-    var ticksCoords = axis.getTicksCoords();
-    var ticksEls = createTicks(ticksCoords, transformGroup.transform, tickEndCoord, defaults(lineStyleModel.getLineStyle(), {
-      stroke: axisModel.get(['axisLine', 'lineStyle', 'color'])
-    }), 'ticks');
-
-    for (var i = 0; i < ticksEls.length; i++) {
-      group.add(ticksEls[i]);
-    }
-
-    return ticksEls;
-  }
-
-  function buildAxisMinorTicks(group, transformGroup, axisModel, tickDirection) {
-    var axis = axisModel.axis;
-    var minorTickModel = axisModel.getModel('minorTick');
-
-    if (!minorTickModel.get('show') || axis.scale.isBlank()) {
-      return;
-    }
-
-    var minorTicksCoords = axis.getMinorTicksCoords();
-
-    if (!minorTicksCoords.length) {
-      return;
-    }
-
-    var lineStyleModel = minorTickModel.getModel('lineStyle');
-    var tickEndCoord = tickDirection * minorTickModel.get('length');
-    var minorTickLineStyle = defaults(lineStyleModel.getLineStyle(), defaults(axisModel.getModel('axisTick').getLineStyle(), {
-      stroke: axisModel.get(['axisLine', 'lineStyle', 'color'])
-    }));
-
-    for (var i = 0; i < minorTicksCoords.length; i++) {
-      var minorTicksEls = createTicks(minorTicksCoords[i], transformGroup.transform, tickEndCoord, minorTickLineStyle, 'minorticks_' + i);
-
-      for (var k = 0; k < minorTicksEls.length; k++) {
-        group.add(minorTicksEls[k]);
-      }
-    }
-  }
-
-  function buildAxisLabel(group, transformGroup, axisModel, opt) {
-    var axis = axisModel.axis;
-    var show = retrieve(opt.axisLabelShow, axisModel.get(['axisLabel', 'show']));
-
-    if (!show || axis.scale.isBlank()) {
-      return;
-    }
-
-    var labelModel = axisModel.getModel('axisLabel');
-    var labelMargin = labelModel.get('margin');
-    var labels = axis.getViewLabels(); // Special label rotate.
-
-    var labelRotation = (retrieve(opt.labelRotate, labelModel.get('rotate')) || 0) * PI$4 / 180;
-    var labelLayout = AxisBuilder.innerTextLayout(opt.rotation, labelRotation, opt.labelDirection);
-    var rawCategoryData = axisModel.getCategories && axisModel.getCategories(true);
-    var labelEls = [];
-    var silent = AxisBuilder.isLabelSilent(axisModel);
-    var triggerEvent = axisModel.get('triggerEvent');
-    each(labels, function (labelItem, index) {
-      var tickValue = axis.scale.type === 'ordinal' ? axis.scale.getRawOrdinalNumber(labelItem.tickValue) : labelItem.tickValue;
-      var formattedLabel = labelItem.formattedLabel;
-      var rawLabel = labelItem.rawLabel;
-      var itemLabelModel = labelModel;
-
-      if (rawCategoryData && rawCategoryData[tickValue]) {
-        var rawCategoryItem = rawCategoryData[tickValue];
-
-        if (isObject(rawCategoryItem) && rawCategoryItem.textStyle) {
-          itemLabelModel = new Model(rawCategoryItem.textStyle, labelModel, axisModel.ecModel);
-        }
-      }
-
-      var textColor = itemLabelModel.getTextColor() || axisModel.get(['axisLine', 'lineStyle', 'color']);
-      var tickCoord = axis.dataToCoord(tickValue);
-      var textEl = new ZRText({
-        x: tickCoord,
-        y: opt.labelOffset + opt.labelDirection * labelMargin,
-        rotation: labelLayout.rotation,
-        silent: silent,
-        z2: 10 + (labelItem.level || 0),
-        style: createTextStyle(itemLabelModel, {
-          text: formattedLabel,
-          align: itemLabelModel.getShallow('align', true) || labelLayout.textAlign,
-          verticalAlign: itemLabelModel.getShallow('verticalAlign', true) || itemLabelModel.getShallow('baseline', true) || labelLayout.textVerticalAlign,
-          fill: isFunction(textColor) ? textColor( // (1) In category axis with data zoom, tick is not the original
-          // index of axis.data. So tick should not be exposed to user
-          // in category axis.
-          // (2) Compatible with previous version, which always use formatted label as
-          // input. But in interval scale the formatted label is like '223,445', which
-          // maked user repalce ','. So we modify it to return original val but remain
-          // it as 'string' to avoid error in replacing.
-          axis.type === 'category' ? rawLabel : axis.type === 'value' ? tickValue + '' : tickValue, index) : textColor
-        })
-      });
-      textEl.anid = 'label_' + tickValue; // Pack data for mouse event
-
-      if (triggerEvent) {
-        var eventData = AxisBuilder.makeAxisEventDataBase(axisModel);
-        eventData.targetType = 'axisLabel';
-        eventData.value = rawLabel;
-        eventData.tickIndex = index;
-
-        if (axis.type === 'category') {
-          eventData.dataIndex = tickValue;
-        }
-
-        getECData(textEl).eventData = eventData;
-      } // FIXME
-
-
-      transformGroup.add(textEl);
-      textEl.updateTransform();
-      labelEls.push(textEl);
-      group.add(textEl);
-      textEl.decomposeTransform();
-    });
-    return labelEls;
   }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
@@ -48886,109 +54573,6 @@
       width: wh[xDimIndex],
       height: wh[1 - xDimIndex]
     };
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * Can only be called after coordinate system creation stage.
-   * (Can be called before coordinate system update stage).
-   */
-
-
-  function layout$1(gridModel, axisModel, opt) {
-    opt = opt || {};
-    var grid = gridModel.coordinateSystem;
-    var axis = axisModel.axis;
-    var layout = {};
-    var otherAxisOnZeroOf = axis.getAxesOnZeroOf()[0];
-    var rawAxisPosition = axis.position;
-    var axisPosition = otherAxisOnZeroOf ? 'onZero' : rawAxisPosition;
-    var axisDim = axis.dim;
-    var rect = grid.getRect();
-    var rectBound = [rect.x, rect.x + rect.width, rect.y, rect.y + rect.height];
-    var idx = {
-      left: 0,
-      right: 1,
-      top: 0,
-      bottom: 1,
-      onZero: 2
-    };
-    var axisOffset = axisModel.get('offset') || 0;
-    var posBound = axisDim === 'x' ? [rectBound[2] - axisOffset, rectBound[3] + axisOffset] : [rectBound[0] - axisOffset, rectBound[1] + axisOffset];
-
-    if (otherAxisOnZeroOf) {
-      var onZeroCoord = otherAxisOnZeroOf.toGlobalCoord(otherAxisOnZeroOf.dataToCoord(0));
-      posBound[idx.onZero] = Math.max(Math.min(onZeroCoord, posBound[1]), posBound[0]);
-    } // Axis position
-
-
-    layout.position = [axisDim === 'y' ? posBound[idx[axisPosition]] : rectBound[0], axisDim === 'x' ? posBound[idx[axisPosition]] : rectBound[3]]; // Axis rotation
-
-    layout.rotation = Math.PI / 2 * (axisDim === 'x' ? 0 : 1); // Tick and label direction, x y is axisDim
-
-    var dirMap = {
-      top: -1,
-      bottom: 1,
-      left: -1,
-      right: 1
-    };
-    layout.labelDirection = layout.tickDirection = layout.nameDirection = dirMap[rawAxisPosition];
-    layout.labelOffset = otherAxisOnZeroOf ? posBound[idx[rawAxisPosition]] - posBound[idx.onZero] : 0;
-
-    if (axisModel.get(['axisTick', 'inside'])) {
-      layout.tickDirection = -layout.tickDirection;
-    }
-
-    if (retrieve(opt.labelInside, axisModel.get(['axisLabel', 'inside']))) {
-      layout.labelDirection = -layout.labelDirection;
-    } // Special label rotation
-
-
-    var labelRotate = axisModel.get(['axisLabel', 'rotate']);
-    layout.labelRotate = axisPosition === 'top' ? -labelRotate : labelRotate; // Over splitLine and splitArea
-
-    layout.z2 = 1;
-    return layout;
   }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
@@ -49303,7 +54887,7 @@
   */
 
 
-  var inner$7 = makeInner();
+  var inner$8 = makeInner();
   var each$3 = each;
   /**
    * @param {string} key
@@ -49319,18 +54903,18 @@
     }
 
     var zr = api.getZr();
-    inner$7(zr).records || (inner$7(zr).records = {});
+    inner$8(zr).records || (inner$8(zr).records = {});
     initGlobalListeners(zr, api);
-    var record = inner$7(zr).records[key] || (inner$7(zr).records[key] = {});
+    var record = inner$8(zr).records[key] || (inner$8(zr).records[key] = {});
     record.handler = handler;
   }
 
   function initGlobalListeners(zr, api) {
-    if (inner$7(zr).initialized) {
+    if (inner$8(zr).initialized) {
       return;
     }
 
-    inner$7(zr).initialized = true;
+    inner$8(zr).initialized = true;
     useHandler('click', curry(doEnter, 'click'));
     useHandler('mousemove', curry(doEnter, 'mousemove')); // useHandler('mouseout', onLeave);
 
@@ -49339,7 +54923,7 @@
     function useHandler(eventType, cb) {
       zr.on(eventType, function (e) {
         var dis = makeDispatchAction(api);
-        each$3(inner$7(zr).records, function (record) {
+        each$3(inner$8(zr).records, function (record) {
           record && cb(record, e, dis.dispatchAction);
         });
         dispatchTooltipFinally(dis.pendings, api);
@@ -49405,10 +54989,10 @@
     }
 
     var zr = api.getZr();
-    var record = (inner$7(zr).records || {})[key];
+    var record = (inner$8(zr).records || {})[key];
 
     if (record) {
-      inner$7(zr).records[key] = null;
+      inner$8(zr).records[key] = null;
     }
   }
   /*
@@ -49641,7 +55225,7 @@
   */
 
 
-  var inner$8 = makeInner();
+  var inner$9 = makeInner();
   /**
    * Basic logic: check all axis, if they do not demand show/highlight,
    * then hide/downplay them.
@@ -49944,8 +55528,8 @@
     // (Consider confilct (e.g., legend and axisPointer) and setOption)
     var zr = api.getZr();
     var highDownKey = 'axisPointerLastHighlights';
-    var lastHighlights = inner$8(zr)[highDownKey] || {};
-    var newHighlights = inner$8(zr)[highDownKey] = {}; // Update highlight/downplay status according to axisPointer model.
+    var lastHighlights = inner$9(zr)[highDownKey] || {};
+    var newHighlights = inner$9(zr)[highDownKey] = {}; // Update highlight/downplay status according to axisPointer model.
     // Build hash map and remove duplicate incidentally.
 
     each(axesInfo, function (axisInfo, key) {
@@ -50046,7 +55630,7 @@
   */
 
 
-  function install$6(registers) {
+  function install$8(registers) {
     // CartesianAxisPointer is not supposed to be required here. But consider
     // echarts.simple.js and online build tooltip, which only require gridSimple,
     // CartesianAxisPointer should be able to required somewhere.
@@ -51937,8 +57521,8 @@
   */
 
 
-  function install$5(registers) {
-    use(install$6);
+  function install$7(registers) {
+    use(install$8);
     registers.registerComponentModel(TooltipModel);
     registers.registerComponentView(TooltipView);
     /**
@@ -52004,7 +57588,4503 @@
   */
 
 
-  use(install$5);
+  use(install$7);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  function checkMarkerInSeries(seriesOpts, markerType) {
+    if (!seriesOpts) {
+      return false;
+    }
+
+    var seriesOptArr = isArray(seriesOpts) ? seriesOpts : [seriesOpts];
+
+    for (var idx = 0; idx < seriesOptArr.length; idx++) {
+      if (seriesOptArr[idx] && seriesOptArr[idx][markerType]) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function fillLabel(opt) {
+    defaultEmphasis(opt, 'label', ['show']);
+  } // { [componentType]: MarkerModel }
+
+
+  var inner$10 = makeInner();
+
+  var MarkerModel =
+  /** @class */
+  function (_super) {
+    __extends(MarkerModel, _super);
+
+    function MarkerModel() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = MarkerModel.type;
+      /**
+       * If marker model is created by self from series
+       */
+
+      _this.createdBySelf = false;
+      return _this;
+    }
+    /**
+     * @overrite
+     */
+
+
+    MarkerModel.prototype.init = function (option, parentModel, ecModel) {
+      {
+        if (this.type === 'marker') {
+          throw new Error('Marker component is abstract component. Use markLine, markPoint, markArea instead.');
+        }
+      }
+      this.mergeDefaultAndTheme(option, ecModel);
+
+      this._mergeOption(option, ecModel, false, true);
+    };
+
+    MarkerModel.prototype.isAnimationEnabled = function () {
+      if (env.node) {
+        return false;
+      }
+
+      var hostSeries = this.__hostSeries;
+      return this.getShallow('animation') && hostSeries && hostSeries.isAnimationEnabled();
+    };
+    /**
+     * @overrite
+     */
+
+
+    MarkerModel.prototype.mergeOption = function (newOpt, ecModel) {
+      this._mergeOption(newOpt, ecModel, false, false);
+    };
+
+    MarkerModel.prototype._mergeOption = function (newOpt, ecModel, createdBySelf, isInit) {
+      var componentType = this.mainType;
+
+      if (!createdBySelf) {
+        ecModel.eachSeries(function (seriesModel) {
+          // mainType can be markPoint, markLine, markArea
+          var markerOpt = seriesModel.get(this.mainType, true);
+          var markerModel = inner$10(seriesModel)[componentType];
+
+          if (!markerOpt || !markerOpt.data) {
+            inner$10(seriesModel)[componentType] = null;
+            return;
+          }
+
+          if (!markerModel) {
+            if (isInit) {
+              // Default label emphasis `position` and `show`
+              fillLabel(markerOpt);
+            }
+
+            each(markerOpt.data, function (item) {
+              // FIXME Overwrite fillLabel method ?
+              if (item instanceof Array) {
+                fillLabel(item[0]);
+                fillLabel(item[1]);
+              } else {
+                fillLabel(item);
+              }
+            });
+            markerModel = this.createMarkerModelFromSeries(markerOpt, this, ecModel); // markerModel = new ImplementedMarkerModel(
+            //     markerOpt, this, ecModel
+            // );
+
+            extend(markerModel, {
+              mainType: this.mainType,
+              // Use the same series index and name
+              seriesIndex: seriesModel.seriesIndex,
+              name: seriesModel.name,
+              createdBySelf: true
+            });
+            markerModel.__hostSeries = seriesModel;
+          } else {
+            markerModel._mergeOption(markerOpt, ecModel, true);
+          }
+
+          inner$10(seriesModel)[componentType] = markerModel;
+        }, this);
+      }
+    };
+
+    MarkerModel.prototype.formatTooltip = function (dataIndex, multipleSeries, dataType) {
+      var data = this.getData();
+      var value = this.getRawValue(dataIndex);
+      var itemName = data.getName(dataIndex);
+      return createTooltipMarkup('section', {
+        header: this.name,
+        blocks: [createTooltipMarkup('nameValue', {
+          name: itemName,
+          value: value,
+          noName: !itemName,
+          noValue: value == null
+        })]
+      });
+    };
+
+    MarkerModel.prototype.getData = function () {
+      return this._data;
+    };
+
+    MarkerModel.prototype.setData = function (data) {
+      this._data = data;
+    };
+
+    MarkerModel.getMarkerModelFromSeries = function (seriesModel, // Support three types of markers. Strict check.
+    componentType) {
+      return inner$10(seriesModel)[componentType];
+    };
+
+    MarkerModel.type = 'marker';
+    MarkerModel.dependencies = ['series', 'grid', 'polar', 'geo'];
+    return MarkerModel;
+  }(ComponentModel);
+
+  mixin(MarkerModel, DataFormatMixin.prototype);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var MarkPointModel =
+  /** @class */
+  function (_super) {
+    __extends(MarkPointModel, _super);
+
+    function MarkPointModel() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = MarkPointModel.type;
+      return _this;
+    }
+
+    MarkPointModel.prototype.createMarkerModelFromSeries = function (markerOpt, masterMarkerModel, ecModel) {
+      return new MarkPointModel(markerOpt, masterMarkerModel, ecModel);
+    };
+
+    MarkPointModel.type = 'markPoint';
+    MarkPointModel.defaultOption = {
+      // zlevel: 0,
+      z: 5,
+      symbol: 'pin',
+      symbolSize: 50,
+      // symbolRotate: 0,
+      // symbolOffset: [0, 0]
+      tooltip: {
+        trigger: 'item'
+      },
+      label: {
+        show: true,
+        position: 'inside'
+      },
+      itemStyle: {
+        borderWidth: 2
+      },
+      emphasis: {
+        label: {
+          show: true
+        }
+      }
+    };
+    return MarkPointModel;
+  }(MarkerModel);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function hasXOrY(item) {
+    return !(isNaN(parseFloat(item.x)) && isNaN(parseFloat(item.y)));
+  }
+
+  function hasXAndY(item) {
+    return !isNaN(parseFloat(item.x)) && !isNaN(parseFloat(item.y));
+  }
+
+  function markerTypeCalculatorWithExtent(markerType, data, otherDataDim, targetDataDim, otherCoordIndex, targetCoordIndex) {
+    var coordArr = [];
+    var stacked = isDimensionStacked(data, targetDataDim
+    /* , otherDataDim */
+    );
+    var calcDataDim = stacked ? data.getCalculationInfo('stackResultDimension') : targetDataDim;
+    var value = numCalculate(data, calcDataDim, markerType);
+    var dataIndex = data.indicesOfNearest(calcDataDim, value)[0];
+    coordArr[otherCoordIndex] = data.get(otherDataDim, dataIndex);
+    coordArr[targetCoordIndex] = data.get(calcDataDim, dataIndex);
+    var coordArrValue = data.get(targetDataDim, dataIndex); // Make it simple, do not visit all stacked value to count precision.
+
+    var precision = getPrecision(data.get(targetDataDim, dataIndex));
+    precision = Math.min(precision, 20);
+
+    if (precision >= 0) {
+      coordArr[targetCoordIndex] = +coordArr[targetCoordIndex].toFixed(precision);
+    }
+
+    return [coordArr, coordArrValue];
+  } // TODO Specified percent
+
+
+  var markerTypeCalculator = {
+    min: curry(markerTypeCalculatorWithExtent, 'min'),
+    max: curry(markerTypeCalculatorWithExtent, 'max'),
+    average: curry(markerTypeCalculatorWithExtent, 'average'),
+    median: curry(markerTypeCalculatorWithExtent, 'median')
+  };
+  /**
+   * Transform markPoint data item to format used in List by do the following
+   * 1. Calculate statistic like `max`, `min`, `average`
+   * 2. Convert `item.xAxis`, `item.yAxis` to `item.coord` array
+   */
+
+  function dataTransform(seriesModel, item) {
+    if (!item) {
+      return;
+    }
+
+    var data = seriesModel.getData();
+    var coordSys = seriesModel.coordinateSystem;
+    var dims = coordSys.dimensions; // 1. If not specify the position with pixel directly
+    // 2. If `coord` is not a data array. Which uses `xAxis`,
+    // `yAxis` to specify the coord on each dimension
+    // parseFloat first because item.x and item.y can be percent string like '20%'
+
+    if (!hasXAndY(item) && !isArray(item.coord) && coordSys) {
+      var axisInfo = getAxisInfo$1(item, data, coordSys, seriesModel); // Clone the option
+      // Transform the properties xAxis, yAxis, radiusAxis, angleAxis, geoCoord to value
+
+      item = clone(item);
+
+      if (item.type && markerTypeCalculator[item.type] && axisInfo.baseAxis && axisInfo.valueAxis) {
+        var otherCoordIndex = indexOf(dims, axisInfo.baseAxis.dim);
+        var targetCoordIndex = indexOf(dims, axisInfo.valueAxis.dim);
+        var coordInfo = markerTypeCalculator[item.type](data, axisInfo.baseDataDim, axisInfo.valueDataDim, otherCoordIndex, targetCoordIndex);
+        item.coord = coordInfo[0]; // Force to use the value of calculated value.
+        // let item use the value without stack.
+
+        item.value = coordInfo[1];
+      } else {
+        // FIXME Only has one of xAxis and yAxis.
+        item.coord = [item.xAxis != null ? item.xAxis : item.radiusAxis, item.yAxis != null ? item.yAxis : item.angleAxis];
+      }
+    } // x y is provided
+
+
+    if (item.coord == null) {
+      item.coord = [];
+    } else {
+      // Each coord support max, min, average
+      var coord = item.coord;
+
+      for (var i = 0; i < 2; i++) {
+        if (markerTypeCalculator[coord[i]]) {
+          coord[i] = numCalculate(data, data.mapDimension(dims[i]), coord[i]);
+        }
+      }
+    }
+
+    return item;
+  }
+
+  function getAxisInfo$1(item, data, coordSys, seriesModel) {
+    var ret = {};
+
+    if (item.valueIndex != null || item.valueDim != null) {
+      ret.valueDataDim = item.valueIndex != null ? data.getDimension(item.valueIndex) : item.valueDim;
+      ret.valueAxis = coordSys.getAxis(dataDimToCoordDim(seriesModel, ret.valueDataDim));
+      ret.baseAxis = coordSys.getOtherAxis(ret.valueAxis);
+      ret.baseDataDim = data.mapDimension(ret.baseAxis.dim);
+    } else {
+      ret.baseAxis = seriesModel.getBaseAxis();
+      ret.valueAxis = coordSys.getOtherAxis(ret.baseAxis);
+      ret.baseDataDim = data.mapDimension(ret.baseAxis.dim);
+      ret.valueDataDim = data.mapDimension(ret.valueAxis.dim);
+    }
+
+    return ret;
+  }
+
+  function dataDimToCoordDim(seriesModel, dataDim) {
+    var dimItem = seriesModel.getData().getDimensionInfo(dataDim);
+    return dimItem && dimItem.coordDim;
+  }
+  /**
+   * Filter data which is out of coordinateSystem range
+   * [dataFilter description]
+   */
+
+
+  function dataFilter( // Currently only polar and cartesian has containData.
+  coordSys, item) {
+    // Always return true if there is no coordSys
+    return coordSys && coordSys.containData && item.coord && !hasXOrY(item) ? coordSys.containData(item.coord) : true;
+  }
+
+  function createMarkerDimValueGetter(inCoordSys, dims) {
+    return inCoordSys ? function (item, dimName, dataIndex, dimIndex) {
+      var rawVal = dimIndex < 2 // x, y, radius, angle
+      ? item.coord && item.coord[dimIndex] : item.value;
+      return parseDataValue(rawVal, dims[dimIndex]);
+    } : function (item, dimName, dataIndex, dimIndex) {
+      return parseDataValue(item.value, dims[dimIndex]);
+    };
+  }
+
+  function numCalculate(data, valueDataDim, type) {
+    if (type === 'average') {
+      var sum_1 = 0;
+      var count_1 = 0;
+      data.each(valueDataDim, function (val, idx) {
+        if (!isNaN(val)) {
+          sum_1 += val;
+          count_1++;
+        }
+      });
+      return sum_1 / count_1;
+    } else if (type === 'median') {
+      return data.getMedian(valueDataDim);
+    } else {
+      // max & min
+      return data.getDataExtent(valueDataDim)[type === 'max' ? 1 : 0];
+    }
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var inner$11 = makeInner();
+
+  var MarkerView =
+  /** @class */
+  function (_super) {
+    __extends(MarkerView, _super);
+
+    function MarkerView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = MarkerView.type;
+      return _this;
+    }
+
+    MarkerView.prototype.init = function () {
+      this.markerGroupMap = createHashMap();
+    };
+
+    MarkerView.prototype.render = function (markerModel, ecModel, api) {
+      var _this = this;
+
+      var markerGroupMap = this.markerGroupMap;
+      markerGroupMap.each(function (item) {
+        inner$11(item).keep = false;
+      });
+      ecModel.eachSeries(function (seriesModel) {
+        var markerModel = MarkerModel.getMarkerModelFromSeries(seriesModel, _this.type);
+        markerModel && _this.renderSeries(seriesModel, markerModel, ecModel, api);
+      });
+      markerGroupMap.each(function (item) {
+        !inner$11(item).keep && _this.group.remove(item.group);
+      });
+    };
+
+    MarkerView.prototype.markKeep = function (drawGroup) {
+      inner$11(drawGroup).keep = true;
+    };
+
+    MarkerView.prototype.toggleBlurSeries = function (seriesModelList, isBlur) {
+      var _this = this;
+
+      each(seriesModelList, function (seriesModel) {
+        var markerModel = MarkerModel.getMarkerModelFromSeries(seriesModel, _this.type);
+
+        if (markerModel) {
+          var data = markerModel.getData();
+          data.eachItemGraphicEl(function (el) {
+            if (el) {
+              isBlur ? enterBlur(el) : leaveBlur(el);
+            }
+          });
+        }
+      });
+    };
+
+    MarkerView.type = 'marker';
+    return MarkerView;
+  }(ComponentView);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function updateMarkerLayout(mpData, seriesModel, api) {
+    var coordSys = seriesModel.coordinateSystem;
+    mpData.each(function (idx) {
+      var itemModel = mpData.getItemModel(idx);
+      var point;
+      var xPx = parsePercent$1(itemModel.get('x'), api.getWidth());
+      var yPx = parsePercent$1(itemModel.get('y'), api.getHeight());
+
+      if (!isNaN(xPx) && !isNaN(yPx)) {
+        point = [xPx, yPx];
+      } // Chart like bar may have there own marker positioning logic
+      else if (seriesModel.getMarkerPosition) {
+          // Use the getMarkerPosition
+          point = seriesModel.getMarkerPosition(mpData.getValues(mpData.dimensions, idx));
+        } else if (coordSys) {
+          var x = mpData.get(coordSys.dimensions[0], idx);
+          var y = mpData.get(coordSys.dimensions[1], idx);
+          point = coordSys.dataToPoint([x, y]);
+        } // Use x, y if has any
+
+
+      if (!isNaN(xPx)) {
+        point[0] = xPx;
+      }
+
+      if (!isNaN(yPx)) {
+        point[1] = yPx;
+      }
+
+      mpData.setItemLayout(idx, point);
+    });
+  }
+
+  var MarkPointView =
+  /** @class */
+  function (_super) {
+    __extends(MarkPointView, _super);
+
+    function MarkPointView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = MarkPointView.type;
+      return _this;
+    }
+
+    MarkPointView.prototype.updateTransform = function (markPointModel, ecModel, api) {
+      ecModel.eachSeries(function (seriesModel) {
+        var mpModel = MarkerModel.getMarkerModelFromSeries(seriesModel, 'markPoint');
+
+        if (mpModel) {
+          updateMarkerLayout(mpModel.getData(), seriesModel, api);
+          this.markerGroupMap.get(seriesModel.id).updateLayout();
+        }
+      }, this);
+    };
+
+    MarkPointView.prototype.renderSeries = function (seriesModel, mpModel, ecModel, api) {
+      var coordSys = seriesModel.coordinateSystem;
+      var seriesId = seriesModel.id;
+      var seriesData = seriesModel.getData();
+      var symbolDrawMap = this.markerGroupMap;
+      var symbolDraw = symbolDrawMap.get(seriesId) || symbolDrawMap.set(seriesId, new SymbolDraw());
+      var mpData = createData(coordSys, seriesModel, mpModel); // FIXME
+
+      mpModel.setData(mpData);
+      updateMarkerLayout(mpModel.getData(), seriesModel, api);
+      mpData.each(function (idx) {
+        var itemModel = mpData.getItemModel(idx);
+        var symbol = itemModel.getShallow('symbol');
+        var symbolSize = itemModel.getShallow('symbolSize');
+        var symbolRotate = itemModel.getShallow('symbolRotate');
+        var symbolOffset = itemModel.getShallow('symbolOffset');
+        var symbolKeepAspect = itemModel.getShallow('symbolKeepAspect'); // TODO: refactor needed: single data item should not support callback function
+
+        if (isFunction(symbol) || isFunction(symbolSize) || isFunction(symbolRotate) || isFunction(symbolOffset)) {
+          var rawIdx = mpModel.getRawValue(idx);
+          var dataParams = mpModel.getDataParams(idx);
+
+          if (isFunction(symbol)) {
+            symbol = symbol(rawIdx, dataParams);
+          }
+
+          if (isFunction(symbolSize)) {
+            // FIXME 这里不兼容 ECharts 2.x，2.x 貌似参数是整个数据？
+            symbolSize = symbolSize(rawIdx, dataParams);
+          }
+
+          if (isFunction(symbolRotate)) {
+            symbolRotate = symbolRotate(rawIdx, dataParams);
+          }
+
+          if (isFunction(symbolOffset)) {
+            symbolOffset = symbolOffset(rawIdx, dataParams);
+          }
+        }
+
+        var style = itemModel.getModel('itemStyle').getItemStyle();
+        var color = getVisualFromData(seriesData, 'color');
+
+        if (!style.fill) {
+          style.fill = color;
+        }
+
+        mpData.setItemVisual(idx, {
+          symbol: symbol,
+          symbolSize: symbolSize,
+          symbolRotate: symbolRotate,
+          symbolOffset: symbolOffset,
+          symbolKeepAspect: symbolKeepAspect,
+          style: style
+        });
+      }); // TODO Text are wrong
+
+      symbolDraw.updateData(mpData);
+      this.group.add(symbolDraw.group); // Set host model for tooltip
+      // FIXME
+
+      mpData.eachItemGraphicEl(function (el) {
+        el.traverse(function (child) {
+          getECData(child).dataModel = mpModel;
+        });
+      });
+      this.markKeep(symbolDraw);
+      symbolDraw.group.silent = mpModel.get('silent') || seriesModel.get('silent');
+    };
+
+    MarkPointView.type = 'markPoint';
+    return MarkPointView;
+  }(MarkerView);
+
+  function createData(coordSys, seriesModel, mpModel) {
+    var coordDimsInfos;
+
+    if (coordSys) {
+      coordDimsInfos = map(coordSys && coordSys.dimensions, function (coordDim) {
+        var info = seriesModel.getData().getDimensionInfo(seriesModel.getData().mapDimension(coordDim)) || {}; // In map series data don't have lng and lat dimension. Fallback to same with coordSys
+
+        return extend(extend({}, info), {
+          name: coordDim,
+          // DON'T use ordinalMeta to parse and collect ordinal.
+          ordinalMeta: null
+        });
+      });
+    } else {
+      coordDimsInfos = [{
+        name: 'value',
+        type: 'float'
+      }];
+    }
+
+    var mpData = new SeriesData(coordDimsInfos, mpModel);
+    var dataOpt = map(mpModel.get('data'), curry(dataTransform, seriesModel));
+
+    if (coordSys) {
+      dataOpt = filter(dataOpt, curry(dataFilter, coordSys));
+    }
+
+    var dimValueGetter = createMarkerDimValueGetter(!!coordSys, coordDimsInfos);
+    mpData.initData(dataOpt, null, dimValueGetter);
+    return mpData;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+
+  function install$9(registers) {
+    registers.registerComponentModel(MarkPointModel);
+    registers.registerComponentView(MarkPointView);
+    registers.registerPreprocessor(function (opt) {
+      if (checkMarkerInSeries(opt.series, 'markPoint')) {
+        // Make sure markPoint component is enabled
+        opt.markPoint = opt.markPoint || {};
+      }
+    });
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+  // HINT Markpoint can't be used too much
+
+
+  use(install$9);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var DATA_ZOOM_AXIS_DIMENSIONS = ['x', 'y', 'radius', 'angle', 'single']; // Supported coords.
+  // FIXME: polar has been broken (but rarely used).
+
+  var SERIES_COORDS = ['cartesian2d', 'polar', 'singleAxis'];
+
+  function isCoordSupported(seriesModel) {
+    var coordType = seriesModel.get('coordinateSystem');
+    return indexOf(SERIES_COORDS, coordType) >= 0;
+  }
+
+  function getAxisMainType(axisDim) {
+    {
+      assert(axisDim);
+    }
+    return axisDim + 'Axis';
+  }
+  /**
+   * If two dataZoomModels has the same axis controlled, we say that they are 'linked'.
+   * This function finds all linked dataZoomModels start from the given payload.
+   */
+
+
+  function findEffectedDataZooms(ecModel, payload) {
+    // Key: `DataZoomAxisDimension`
+    var axisRecords = createHashMap();
+    var effectedModels = []; // Key: uid of dataZoomModel
+
+    var effectedModelMap = createHashMap(); // Find the dataZooms specified by payload.
+
+    ecModel.eachComponent({
+      mainType: 'dataZoom',
+      query: payload
+    }, function (dataZoomModel) {
+      if (!effectedModelMap.get(dataZoomModel.uid)) {
+        addToEffected(dataZoomModel);
+      }
+    }); // Start from the given dataZoomModels, travel the graph to find
+    // all of the linked dataZoom models.
+
+    var foundNewLink;
+
+    do {
+      foundNewLink = false;
+      ecModel.eachComponent('dataZoom', processSingle);
+    } while (foundNewLink);
+
+    function processSingle(dataZoomModel) {
+      if (!effectedModelMap.get(dataZoomModel.uid) && isLinked(dataZoomModel)) {
+        addToEffected(dataZoomModel);
+        foundNewLink = true;
+      }
+    }
+
+    function addToEffected(dataZoom) {
+      effectedModelMap.set(dataZoom.uid, true);
+      effectedModels.push(dataZoom);
+      markAxisControlled(dataZoom);
+    }
+
+    function isLinked(dataZoomModel) {
+      var isLink = false;
+      dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+        var axisIdxArr = axisRecords.get(axisDim);
+
+        if (axisIdxArr && axisIdxArr[axisIndex]) {
+          isLink = true;
+        }
+      });
+      return isLink;
+    }
+
+    function markAxisControlled(dataZoomModel) {
+      dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+        (axisRecords.get(axisDim) || axisRecords.set(axisDim, []))[axisIndex] = true;
+      });
+    }
+
+    return effectedModels;
+  }
+  /**
+   * Find the first target coordinate system.
+   * Available after model built.
+   *
+   * @return Like {
+   *                  grid: [
+   *                      {model: coord0, axisModels: [axis1, axis3], coordIndex: 1},
+   *                      {model: coord1, axisModels: [axis0, axis2], coordIndex: 0},
+   *                      ...
+   *                  ],  // cartesians must not be null/undefined.
+   *                  polar: [
+   *                      {model: coord0, axisModels: [axis4], coordIndex: 0},
+   *                      ...
+   *                  ],  // polars must not be null/undefined.
+   *                  singleAxis: [
+   *                      {model: coord0, axisModels: [], coordIndex: 0}
+   *                  ]
+   *              }
+   */
+
+
+  function collectReferCoordSysModelInfo(dataZoomModel) {
+    var ecModel = dataZoomModel.ecModel;
+    var coordSysInfoWrap = {
+      infoList: [],
+      infoMap: createHashMap()
+    };
+    dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+      var axisModel = ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
+
+      if (!axisModel) {
+        return;
+      }
+
+      var coordSysModel = axisModel.getCoordSysModel();
+
+      if (!coordSysModel) {
+        return;
+      }
+
+      var coordSysUid = coordSysModel.uid;
+      var coordSysInfo = coordSysInfoWrap.infoMap.get(coordSysUid);
+
+      if (!coordSysInfo) {
+        coordSysInfo = {
+          model: coordSysModel,
+          axisModels: []
+        };
+        coordSysInfoWrap.infoList.push(coordSysInfo);
+        coordSysInfoWrap.infoMap.set(coordSysUid, coordSysInfo);
+      }
+
+      coordSysInfo.axisModels.push(axisModel);
+    });
+    return coordSysInfoWrap;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var DataZoomAxisInfo =
+  /** @class */
+  function () {
+    function DataZoomAxisInfo() {
+      this.indexList = [];
+      this.indexMap = [];
+    }
+
+    DataZoomAxisInfo.prototype.add = function (axisCmptIdx) {
+      // Remove duplication.
+      if (!this.indexMap[axisCmptIdx]) {
+        this.indexList.push(axisCmptIdx);
+        this.indexMap[axisCmptIdx] = true;
+      }
+    };
+
+    return DataZoomAxisInfo;
+  }();
+
+  var DataZoomModel =
+  /** @class */
+  function (_super) {
+    __extends(DataZoomModel, _super);
+
+    function DataZoomModel() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = DataZoomModel.type;
+      _this._autoThrottle = true;
+      _this._noTarget = true;
+      /**
+       * It is `[rangeModeForMin, rangeModeForMax]`.
+       * The optional values for `rangeMode`:
+       * + `'value'` mode: the axis extent will always be determined by
+       *     `dataZoom.startValue` and `dataZoom.endValue`, despite
+       *     how data like and how `axis.min` and `axis.max` are.
+       * + `'percent'` mode: `100` represents 100% of the `[dMin, dMax]`,
+       *     where `dMin` is `axis.min` if `axis.min` specified, otherwise `data.extent[0]`,
+       *     and `dMax` is `axis.max` if `axis.max` specified, otherwise `data.extent[1]`.
+       *     Axis extent will be determined by the result of the percent of `[dMin, dMax]`.
+       *
+       * For example, when users are using dynamic data (update data periodically via `setOption`),
+       * if in `'value`' mode, the window will be kept in a fixed value range despite how
+       * data are appended, while if in `'percent'` mode, whe window range will be changed alone with
+       * the appended data (suppose `axis.min` and `axis.max` are not specified).
+       */
+
+      _this._rangePropMode = ['percent', 'percent'];
+      return _this;
+    }
+
+    DataZoomModel.prototype.init = function (option, parentModel, ecModel) {
+      var inputRawOption = retrieveRawOption(option);
+      /**
+       * Suppose a "main process" start at the point that model prepared (that is,
+       * model initialized or merged or method called in `action`).
+       * We should keep the `main process` idempotent, that is, given a set of values
+       * on `option`, we get the same result.
+       *
+       * But sometimes, values on `option` will be updated for providing users
+       * a "final calculated value" (`dataZoomProcessor` will do that). Those value
+       * should not be the base/input of the `main process`.
+       *
+       * So in that case we should save and keep the input of the `main process`
+       * separately, called `settledOption`.
+       *
+       * For example, consider the case:
+       * (Step_1) brush zoom the grid by `toolbox.dataZoom`,
+       *     where the original input `option.startValue`, `option.endValue` are earsed by
+       *     calculated value.
+       * (Step)2) click the legend to hide and show a series,
+       *     where the new range is calculated by the earsed `startValue` and `endValue`,
+       *     which brings incorrect result.
+       */
+
+      this.settledOption = inputRawOption;
+      this.mergeDefaultAndTheme(option, ecModel);
+
+      this._doInit(inputRawOption);
+    };
+
+    DataZoomModel.prototype.mergeOption = function (newOption) {
+      var inputRawOption = retrieveRawOption(newOption); // FIX #2591
+
+      merge(this.option, newOption, true);
+      merge(this.settledOption, inputRawOption, true);
+
+      this._doInit(inputRawOption);
+    };
+
+    DataZoomModel.prototype._doInit = function (inputRawOption) {
+      var thisOption = this.option;
+
+      this._setDefaultThrottle(inputRawOption);
+
+      this._updateRangeUse(inputRawOption);
+
+      var settledOption = this.settledOption;
+      each([['start', 'startValue'], ['end', 'endValue']], function (names, index) {
+        // start/end has higher priority over startValue/endValue if they
+        // both set, but we should make chart.setOption({endValue: 1000})
+        // effective, rather than chart.setOption({endValue: 1000, end: null}).
+        if (this._rangePropMode[index] === 'value') {
+          thisOption[names[0]] = settledOption[names[0]] = null;
+        } // Otherwise do nothing and use the merge result.
+
+      }, this);
+
+      this._resetTarget();
+    };
+
+    DataZoomModel.prototype._resetTarget = function () {
+      var optionOrient = this.get('orient', true);
+      var targetAxisIndexMap = this._targetAxisInfoMap = createHashMap();
+
+      var hasAxisSpecified = this._fillSpecifiedTargetAxis(targetAxisIndexMap);
+
+      if (hasAxisSpecified) {
+        this._orient = optionOrient || this._makeAutoOrientByTargetAxis();
+      } else {
+        this._orient = optionOrient || 'horizontal';
+
+        this._fillAutoTargetAxisByOrient(targetAxisIndexMap, this._orient);
+      }
+
+      this._noTarget = true;
+      targetAxisIndexMap.each(function (axisInfo) {
+        if (axisInfo.indexList.length) {
+          this._noTarget = false;
+        }
+      }, this);
+    };
+
+    DataZoomModel.prototype._fillSpecifiedTargetAxis = function (targetAxisIndexMap) {
+      var hasAxisSpecified = false;
+      each(DATA_ZOOM_AXIS_DIMENSIONS, function (axisDim) {
+        var refering = this.getReferringComponents(getAxisMainType(axisDim), MULTIPLE_REFERRING); // When user set axisIndex as a empty array, we think that user specify axisIndex
+        // but do not want use auto mode. Because empty array may be encountered when
+        // some error occurred.
+
+        if (!refering.specified) {
+          return;
+        }
+
+        hasAxisSpecified = true;
+        var axisInfo = new DataZoomAxisInfo();
+        each(refering.models, function (axisModel) {
+          axisInfo.add(axisModel.componentIndex);
+        });
+        targetAxisIndexMap.set(axisDim, axisInfo);
+      }, this);
+      return hasAxisSpecified;
+    };
+
+    DataZoomModel.prototype._fillAutoTargetAxisByOrient = function (targetAxisIndexMap, orient) {
+      var ecModel = this.ecModel;
+      var needAuto = true; // Find axis that parallel to dataZoom as default.
+
+      if (needAuto) {
+        var axisDim = orient === 'vertical' ? 'y' : 'x';
+        var axisModels = ecModel.findComponents({
+          mainType: axisDim + 'Axis'
+        });
+        setParallelAxis(axisModels, axisDim);
+      } // Find axis that parallel to dataZoom as default.
+
+
+      if (needAuto) {
+        var axisModels = ecModel.findComponents({
+          mainType: 'singleAxis',
+          filter: function (axisModel) {
+            return axisModel.get('orient', true) === orient;
+          }
+        });
+        setParallelAxis(axisModels, 'single');
+      }
+
+      function setParallelAxis(axisModels, axisDim) {
+        // At least use the first parallel axis as the target axis.
+        var axisModel = axisModels[0];
+
+        if (!axisModel) {
+          return;
+        }
+
+        var axisInfo = new DataZoomAxisInfo();
+        axisInfo.add(axisModel.componentIndex);
+        targetAxisIndexMap.set(axisDim, axisInfo);
+        needAuto = false; // Find parallel axes in the same grid.
+
+        if (axisDim === 'x' || axisDim === 'y') {
+          var gridModel_1 = axisModel.getReferringComponents('grid', SINGLE_REFERRING).models[0];
+          gridModel_1 && each(axisModels, function (axModel) {
+            if (axisModel.componentIndex !== axModel.componentIndex && gridModel_1 === axModel.getReferringComponents('grid', SINGLE_REFERRING).models[0]) {
+              axisInfo.add(axModel.componentIndex);
+            }
+          });
+        }
+      }
+
+      if (needAuto) {
+        // If no parallel axis, find the first category axis as default. (Also consider polar).
+        each(DATA_ZOOM_AXIS_DIMENSIONS, function (axisDim) {
+          if (!needAuto) {
+            return;
+          }
+
+          var axisModels = ecModel.findComponents({
+            mainType: getAxisMainType(axisDim),
+            filter: function (axisModel) {
+              return axisModel.get('type', true) === 'category';
+            }
+          });
+
+          if (axisModels[0]) {
+            var axisInfo = new DataZoomAxisInfo();
+            axisInfo.add(axisModels[0].componentIndex);
+            targetAxisIndexMap.set(axisDim, axisInfo);
+            needAuto = false;
+          }
+        }, this);
+      }
+    };
+
+    DataZoomModel.prototype._makeAutoOrientByTargetAxis = function () {
+      var dim; // Find the first axis
+
+      this.eachTargetAxis(function (axisDim) {
+        !dim && (dim = axisDim);
+      }, this);
+      return dim === 'y' ? 'vertical' : 'horizontal';
+    };
+
+    DataZoomModel.prototype._setDefaultThrottle = function (inputRawOption) {
+      // When first time user set throttle, auto throttle ends.
+      if (inputRawOption.hasOwnProperty('throttle')) {
+        this._autoThrottle = false;
+      }
+
+      if (this._autoThrottle) {
+        var globalOption = this.ecModel.option;
+        this.option.throttle = globalOption.animation && globalOption.animationDurationUpdate > 0 ? 100 : 20;
+      }
+    };
+
+    DataZoomModel.prototype._updateRangeUse = function (inputRawOption) {
+      var rangePropMode = this._rangePropMode;
+      var rangeModeInOption = this.get('rangeMode');
+      each([['start', 'startValue'], ['end', 'endValue']], function (names, index) {
+        var percentSpecified = inputRawOption[names[0]] != null;
+        var valueSpecified = inputRawOption[names[1]] != null;
+
+        if (percentSpecified && !valueSpecified) {
+          rangePropMode[index] = 'percent';
+        } else if (!percentSpecified && valueSpecified) {
+          rangePropMode[index] = 'value';
+        } else if (rangeModeInOption) {
+          rangePropMode[index] = rangeModeInOption[index];
+        } else if (percentSpecified) {
+          // percentSpecified && valueSpecified
+          rangePropMode[index] = 'percent';
+        } // else remain its original setting.
+
+      });
+    };
+
+    DataZoomModel.prototype.noTarget = function () {
+      return this._noTarget;
+    };
+
+    DataZoomModel.prototype.getFirstTargetAxisModel = function () {
+      var firstAxisModel;
+      this.eachTargetAxis(function (axisDim, axisIndex) {
+        if (firstAxisModel == null) {
+          firstAxisModel = this.ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
+        }
+      }, this);
+      return firstAxisModel;
+    };
+    /**
+     * @param {Function} callback param: axisModel, dimNames, axisIndex, dataZoomModel, ecModel
+     */
+
+
+    DataZoomModel.prototype.eachTargetAxis = function (callback, context) {
+      this._targetAxisInfoMap.each(function (axisInfo, axisDim) {
+        each(axisInfo.indexList, function (axisIndex) {
+          callback.call(context, axisDim, axisIndex);
+        });
+      });
+    };
+    /**
+     * @return If not found, return null/undefined.
+     */
+
+
+    DataZoomModel.prototype.getAxisProxy = function (axisDim, axisIndex) {
+      var axisModel = this.getAxisModel(axisDim, axisIndex);
+
+      if (axisModel) {
+        return axisModel.__dzAxisProxy;
+      }
+    };
+    /**
+     * @return If not found, return null/undefined.
+     */
+
+
+    DataZoomModel.prototype.getAxisModel = function (axisDim, axisIndex) {
+      {
+        assert(axisDim && axisIndex != null);
+      }
+
+      var axisInfo = this._targetAxisInfoMap.get(axisDim);
+
+      if (axisInfo && axisInfo.indexMap[axisIndex]) {
+        return this.ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
+      }
+    };
+    /**
+     * If not specified, set to undefined.
+     */
+
+
+    DataZoomModel.prototype.setRawRange = function (opt) {
+      var thisOption = this.option;
+      var settledOption = this.settledOption;
+      each([['start', 'startValue'], ['end', 'endValue']], function (names) {
+        // Consider the pair <start, startValue>:
+        // If one has value and the other one is `null/undefined`, we both set them
+        // to `settledOption`. This strategy enables the feature to clear the original
+        // value in `settledOption` to `null/undefined`.
+        // But if both of them are `null/undefined`, we do not set them to `settledOption`
+        // and keep `settledOption` with the original value. This strategy enables users to
+        // only set <end or endValue> but not set <start or startValue> when calling
+        // `dispatchAction`.
+        // The pair <end, endValue> is treated in the same way.
+        if (opt[names[0]] != null || opt[names[1]] != null) {
+          thisOption[names[0]] = settledOption[names[0]] = opt[names[0]];
+          thisOption[names[1]] = settledOption[names[1]] = opt[names[1]];
+        }
+      }, this);
+
+      this._updateRangeUse(opt);
+    };
+
+    DataZoomModel.prototype.setCalculatedRange = function (opt) {
+      var option = this.option;
+      each(['start', 'startValue', 'end', 'endValue'], function (name) {
+        option[name] = opt[name];
+      });
+    };
+
+    DataZoomModel.prototype.getPercentRange = function () {
+      var axisProxy = this.findRepresentativeAxisProxy();
+
+      if (axisProxy) {
+        return axisProxy.getDataPercentWindow();
+      }
+    };
+    /**
+     * For example, chart.getModel().getComponent('dataZoom').getValueRange('y', 0);
+     *
+     * @return [startValue, endValue] value can only be '-' or finite number.
+     */
+
+
+    DataZoomModel.prototype.getValueRange = function (axisDim, axisIndex) {
+      if (axisDim == null && axisIndex == null) {
+        var axisProxy = this.findRepresentativeAxisProxy();
+
+        if (axisProxy) {
+          return axisProxy.getDataValueWindow();
+        }
+      } else {
+        return this.getAxisProxy(axisDim, axisIndex).getDataValueWindow();
+      }
+    };
+    /**
+     * @param axisModel If axisModel given, find axisProxy
+     *      corresponding to the axisModel
+     */
+
+
+    DataZoomModel.prototype.findRepresentativeAxisProxy = function (axisModel) {
+      if (axisModel) {
+        return axisModel.__dzAxisProxy;
+      } // Find the first hosted axisProxy
+
+
+      var firstProxy;
+
+      var axisDimList = this._targetAxisInfoMap.keys();
+
+      for (var i = 0; i < axisDimList.length; i++) {
+        var axisDim = axisDimList[i];
+
+        var axisInfo = this._targetAxisInfoMap.get(axisDim);
+
+        for (var j = 0; j < axisInfo.indexList.length; j++) {
+          var proxy = this.getAxisProxy(axisDim, axisInfo.indexList[j]);
+
+          if (proxy.hostedBy(this)) {
+            return proxy;
+          }
+
+          if (!firstProxy) {
+            firstProxy = proxy;
+          }
+        }
+      } // If no hosted proxy found, still need to return a proxy.
+      // This case always happens in toolbox dataZoom, where axes are all hosted by
+      // other dataZooms.
+
+
+      return firstProxy;
+    };
+
+    DataZoomModel.prototype.getRangePropMode = function () {
+      return this._rangePropMode.slice();
+    };
+
+    DataZoomModel.prototype.getOrient = function () {
+      {
+        // Should not be called before initialized.
+        assert(this._orient);
+      }
+      return this._orient;
+    };
+
+    DataZoomModel.type = 'dataZoom';
+    DataZoomModel.dependencies = ['xAxis', 'yAxis', 'radiusAxis', 'angleAxis', 'singleAxis', 'series', 'toolbox'];
+    DataZoomModel.defaultOption = {
+      // zlevel: 0,
+      z: 4,
+      filterMode: 'filter',
+      start: 0,
+      end: 100
+    };
+    return DataZoomModel;
+  }(ComponentModel);
+  /**
+   * Retrieve those raw params from option, which will be cached separately,
+   * because they will be overwritten by normalized/calculated values in the main
+   * process.
+   */
+
+
+  function retrieveRawOption(option) {
+    var ret = {};
+    each(['start', 'end', 'startValue', 'endValue', 'throttle'], function (name) {
+      option.hasOwnProperty(name) && (ret[name] = option[name]);
+    });
+    return ret;
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var InsideZoomModel =
+  /** @class */
+  function (_super) {
+    __extends(InsideZoomModel, _super);
+
+    function InsideZoomModel() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = InsideZoomModel.type;
+      return _this;
+    }
+
+    InsideZoomModel.type = 'dataZoom.inside';
+    InsideZoomModel.defaultOption = inheritDefaultOption(DataZoomModel.defaultOption, {
+      disabled: false,
+      zoomLock: false,
+      zoomOnMouseWheel: true,
+      moveOnMouseMove: true,
+      moveOnMouseWheel: false,
+      preventDefaultMouseMove: true
+    });
+    return InsideZoomModel;
+  }(DataZoomModel);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var DataZoomView =
+  /** @class */
+  function (_super) {
+    __extends(DataZoomView, _super);
+
+    function DataZoomView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = DataZoomView.type;
+      return _this;
+    }
+
+    DataZoomView.prototype.render = function (dataZoomModel, ecModel, api, payload) {
+      this.dataZoomModel = dataZoomModel;
+      this.ecModel = ecModel;
+      this.api = api;
+    };
+
+    DataZoomView.type = 'dataZoom';
+    return DataZoomView;
+  }(ComponentView);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * Calculate slider move result.
+   * Usage:
+   * (1) If both handle0 and handle1 are needed to be moved, set minSpan the same as
+   * maxSpan and the same as `Math.abs(handleEnd[1] - handleEnds[0])`.
+   * (2) If handle0 is forbidden to cross handle1, set minSpan as `0`.
+   *
+   * @param delta Move length.
+   * @param handleEnds handleEnds[0] can be bigger then handleEnds[1].
+   *              handleEnds will be modified in this method.
+   * @param extent handleEnds is restricted by extent.
+   *              extent[0] should less or equals than extent[1].
+   * @param handleIndex Can be 'all', means that both move the two handleEnds.
+   * @param minSpan The range of dataZoom can not be smaller than that.
+   *              If not set, handle0 and cross handle1. If set as a non-negative
+   *              number (including `0`), handles will push each other when reaching
+   *              the minSpan.
+   * @param maxSpan The range of dataZoom can not be larger than that.
+   * @return The input handleEnds.
+   */
+
+
+  function sliderMove(delta, handleEnds, extent, handleIndex, minSpan, maxSpan) {
+    delta = delta || 0;
+    var extentSpan = extent[1] - extent[0]; // Notice maxSpan and minSpan can be null/undefined.
+
+    if (minSpan != null) {
+      minSpan = restrict(minSpan, [0, extentSpan]);
+    }
+
+    if (maxSpan != null) {
+      maxSpan = Math.max(maxSpan, minSpan != null ? minSpan : 0);
+    }
+
+    if (handleIndex === 'all') {
+      var handleSpan = Math.abs(handleEnds[1] - handleEnds[0]);
+      handleSpan = restrict(handleSpan, [0, extentSpan]);
+      minSpan = maxSpan = restrict(handleSpan, [minSpan, maxSpan]);
+      handleIndex = 0;
+    }
+
+    handleEnds[0] = restrict(handleEnds[0], extent);
+    handleEnds[1] = restrict(handleEnds[1], extent);
+    var originalDistSign = getSpanSign(handleEnds, handleIndex);
+    handleEnds[handleIndex] += delta; // Restrict in extent.
+
+    var extentMinSpan = minSpan || 0;
+    var realExtent = extent.slice();
+    originalDistSign.sign < 0 ? realExtent[0] += extentMinSpan : realExtent[1] -= extentMinSpan;
+    handleEnds[handleIndex] = restrict(handleEnds[handleIndex], realExtent); // Expand span.
+
+    var currDistSign;
+    currDistSign = getSpanSign(handleEnds, handleIndex);
+
+    if (minSpan != null && (currDistSign.sign !== originalDistSign.sign || currDistSign.span < minSpan)) {
+      // If minSpan exists, 'cross' is forbidden.
+      handleEnds[1 - handleIndex] = handleEnds[handleIndex] + originalDistSign.sign * minSpan;
+    } // Shrink span.
+
+
+    currDistSign = getSpanSign(handleEnds, handleIndex);
+
+    if (maxSpan != null && currDistSign.span > maxSpan) {
+      handleEnds[1 - handleIndex] = handleEnds[handleIndex] + currDistSign.sign * maxSpan;
+    }
+
+    return handleEnds;
+  }
+
+  function getSpanSign(handleEnds, handleIndex) {
+    var dist = handleEnds[handleIndex] - handleEnds[1 - handleIndex]; // If `handleEnds[0] === handleEnds[1]`, always believe that handleEnd[0]
+    // is at left of handleEnds[1] for non-cross case.
+
+    return {
+      span: Math.abs(dist),
+      sign: dist > 0 ? -1 : dist < 0 ? 1 : handleIndex ? -1 : 1
+    };
+  }
+
+  function restrict(value, extend) {
+    return Math.min(extend[1] != null ? extend[1] : Infinity, Math.max(extend[0] != null ? extend[0] : -Infinity, value));
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+  // @ts-nocheck
+
+
+  var ATTR = '\0_ec_interaction_mutex';
+
+  function take(zr, resourceKey, userKey) {
+    var store = getStore(zr);
+    store[resourceKey] = userKey;
+  }
+
+  function release(zr, resourceKey, userKey) {
+    var store = getStore(zr);
+    var uKey = store[resourceKey];
+
+    if (uKey === userKey) {
+      store[resourceKey] = null;
+    }
+  }
+
+  function isTaken(zr, resourceKey) {
+    return !!getStore(zr)[resourceKey];
+  }
+
+  function getStore(zr) {
+    return zr[ATTR] || (zr[ATTR] = {});
+  }
+  /**
+   * payload: {
+   *     type: 'takeGlobalCursor',
+   *     key: 'dataZoomSelect', or 'brush', or ...,
+   *         If no userKey, release global cursor.
+   * }
+   */
+  // TODO: SELF REGISTERED.
+
+
+  registerAction({
+    type: 'takeGlobalCursor',
+    event: 'globalCursorTaken',
+    update: 'update'
+  }, noop);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var RoamController =
+  /** @class */
+  function (_super) {
+    __extends(RoamController, _super);
+
+    function RoamController(zr) {
+      var _this = _super.call(this) || this;
+
+      _this._zr = zr; // Avoid two roamController bind the same handler
+
+      var mousedownHandler = bind(_this._mousedownHandler, _this);
+      var mousemoveHandler = bind(_this._mousemoveHandler, _this);
+      var mouseupHandler = bind(_this._mouseupHandler, _this);
+      var mousewheelHandler = bind(_this._mousewheelHandler, _this);
+      var pinchHandler = bind(_this._pinchHandler, _this);
+      /**
+       * Notice: only enable needed types. For example, if 'zoom'
+       * is not needed, 'zoom' should not be enabled, otherwise
+       * default mousewheel behaviour (scroll page) will be disabled.
+       */
+
+      _this.enable = function (controlType, opt) {
+        // Disable previous first
+        this.disable();
+        this._opt = defaults(clone(opt) || {}, {
+          zoomOnMouseWheel: true,
+          moveOnMouseMove: true,
+          // By default, wheel do not trigger move.
+          moveOnMouseWheel: false,
+          preventDefaultMouseMove: true
+        });
+
+        if (controlType == null) {
+          controlType = true;
+        }
+
+        if (controlType === true || controlType === 'move' || controlType === 'pan') {
+          zr.on('mousedown', mousedownHandler);
+          zr.on('mousemove', mousemoveHandler);
+          zr.on('mouseup', mouseupHandler);
+        }
+
+        if (controlType === true || controlType === 'scale' || controlType === 'zoom') {
+          zr.on('mousewheel', mousewheelHandler);
+          zr.on('pinch', pinchHandler);
+        }
+      };
+
+      _this.disable = function () {
+        zr.off('mousedown', mousedownHandler);
+        zr.off('mousemove', mousemoveHandler);
+        zr.off('mouseup', mouseupHandler);
+        zr.off('mousewheel', mousewheelHandler);
+        zr.off('pinch', pinchHandler);
+      };
+
+      return _this;
+    }
+
+    RoamController.prototype.isDragging = function () {
+      return this._dragging;
+    };
+
+    RoamController.prototype.isPinching = function () {
+      return this._pinching;
+    };
+
+    RoamController.prototype.setPointerChecker = function (pointerChecker) {
+      this.pointerChecker = pointerChecker;
+    };
+
+    RoamController.prototype.dispose = function () {
+      this.disable();
+    };
+
+    RoamController.prototype._mousedownHandler = function (e) {
+      if (isMiddleOrRightButtonOnMouseUpDown(e)) {
+        return;
+      }
+
+      var el = e.target;
+
+      while (el) {
+        if (el.draggable) {
+          return;
+        } // check if host is draggable
+
+
+        el = el.__hostTarget || el.parent;
+      }
+
+      var x = e.offsetX;
+      var y = e.offsetY; // Only check on mosedown, but not mousemove.
+      // Mouse can be out of target when mouse moving.
+
+      if (this.pointerChecker && this.pointerChecker(e, x, y)) {
+        this._x = x;
+        this._y = y;
+        this._dragging = true;
+      }
+    };
+
+    RoamController.prototype._mousemoveHandler = function (e) {
+      if (!this._dragging || !isAvailableBehavior('moveOnMouseMove', e, this._opt) || e.gestureEvent === 'pinch' || isTaken(this._zr, 'globalPan')) {
+        return;
+      }
+
+      var x = e.offsetX;
+      var y = e.offsetY;
+      var oldX = this._x;
+      var oldY = this._y;
+      var dx = x - oldX;
+      var dy = y - oldY;
+      this._x = x;
+      this._y = y;
+      this._opt.preventDefaultMouseMove && stop(e.event);
+      trigger(this, 'pan', 'moveOnMouseMove', e, {
+        dx: dx,
+        dy: dy,
+        oldX: oldX,
+        oldY: oldY,
+        newX: x,
+        newY: y,
+        isAvailableBehavior: null
+      });
+    };
+
+    RoamController.prototype._mouseupHandler = function (e) {
+      if (!isMiddleOrRightButtonOnMouseUpDown(e)) {
+        this._dragging = false;
+      }
+    };
+
+    RoamController.prototype._mousewheelHandler = function (e) {
+      var shouldZoom = isAvailableBehavior('zoomOnMouseWheel', e, this._opt);
+      var shouldMove = isAvailableBehavior('moveOnMouseWheel', e, this._opt);
+      var wheelDelta = e.wheelDelta;
+      var absWheelDeltaDelta = Math.abs(wheelDelta);
+      var originX = e.offsetX;
+      var originY = e.offsetY; // wheelDelta maybe -0 in chrome mac.
+
+      if (wheelDelta === 0 || !shouldZoom && !shouldMove) {
+        return;
+      } // If both `shouldZoom` and `shouldMove` is true, trigger
+      // their event both, and the final behavior is determined
+      // by event listener themselves.
+
+
+      if (shouldZoom) {
+        // Convenience:
+        // Mac and VM Windows on Mac: scroll up: zoom out.
+        // Windows: scroll up: zoom in.
+        // FIXME: Should do more test in different environment.
+        // wheelDelta is too complicated in difference nvironment
+        // (https://developer.mozilla.org/en-US/docs/Web/Events/mousewheel),
+        // although it has been normallized by zrender.
+        // wheelDelta of mouse wheel is bigger than touch pad.
+        var factor = absWheelDeltaDelta > 3 ? 1.4 : absWheelDeltaDelta > 1 ? 1.2 : 1.1;
+        var scale = wheelDelta > 0 ? factor : 1 / factor;
+        checkPointerAndTrigger(this, 'zoom', 'zoomOnMouseWheel', e, {
+          scale: scale,
+          originX: originX,
+          originY: originY,
+          isAvailableBehavior: null
+        });
+      }
+
+      if (shouldMove) {
+        // FIXME: Should do more test in different environment.
+        var absDelta = Math.abs(wheelDelta); // wheelDelta of mouse wheel is bigger than touch pad.
+
+        var scrollDelta = (wheelDelta > 0 ? 1 : -1) * (absDelta > 3 ? 0.4 : absDelta > 1 ? 0.15 : 0.05);
+        checkPointerAndTrigger(this, 'scrollMove', 'moveOnMouseWheel', e, {
+          scrollDelta: scrollDelta,
+          originX: originX,
+          originY: originY,
+          isAvailableBehavior: null
+        });
+      }
+    };
+
+    RoamController.prototype._pinchHandler = function (e) {
+      if (isTaken(this._zr, 'globalPan')) {
+        return;
+      }
+
+      var scale = e.pinchScale > 1 ? 1.1 : 1 / 1.1;
+      checkPointerAndTrigger(this, 'zoom', null, e, {
+        scale: scale,
+        originX: e.pinchX,
+        originY: e.pinchY,
+        isAvailableBehavior: null
+      });
+    };
+
+    return RoamController;
+  }(Eventful);
+
+  function checkPointerAndTrigger(controller, eventName, behaviorToCheck, e, contollerEvent) {
+    if (controller.pointerChecker && controller.pointerChecker(e, contollerEvent.originX, contollerEvent.originY)) {
+      // When mouse is out of roamController rect,
+      // default befavoius should not be be disabled, otherwise
+      // page sliding is disabled, contrary to expectation.
+      stop(e.event);
+      trigger(controller, eventName, behaviorToCheck, e, contollerEvent);
+    }
+  }
+
+  function trigger(controller, eventName, behaviorToCheck, e, contollerEvent) {
+    // Also provide behavior checker for event listener, for some case that
+    // multiple components share one listener.
+    contollerEvent.isAvailableBehavior = bind(isAvailableBehavior, null, behaviorToCheck, e); // TODO should not have type issue.
+
+    controller.trigger(eventName, contollerEvent);
+  } // settings: {
+  //     zoomOnMouseWheel
+  //     moveOnMouseMove
+  //     moveOnMouseWheel
+  // }
+  // The value can be: true / false / 'shift' / 'ctrl' / 'alt'.
+
+
+  function isAvailableBehavior(behaviorToCheck, e, settings) {
+    var setting = settings[behaviorToCheck];
+    return !behaviorToCheck || setting && (!isString(setting) || e.event[setting + 'Key']);
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+  // Only create one roam controller for each coordinate system.
+  // one roam controller might be refered by two inside data zoom
+  // components (for example, one for x and one for y). When user
+  // pan or zoom, only dispatch one action for those data zoom
+  // components.
+
+
+  var inner$12 = makeInner();
+
+  function setViewInfoToCoordSysRecord(api, dataZoomModel, getRange) {
+    inner$12(api).coordSysRecordMap.each(function (coordSysRecord) {
+      var dzInfo = coordSysRecord.dataZoomInfoMap.get(dataZoomModel.uid);
+
+      if (dzInfo) {
+        dzInfo.getRange = getRange;
+      }
+    });
+  }
+
+  function disposeCoordSysRecordIfNeeded(api, dataZoomModel) {
+    var coordSysRecordMap = inner$12(api).coordSysRecordMap;
+    var coordSysKeyArr = coordSysRecordMap.keys();
+
+    for (var i = 0; i < coordSysKeyArr.length; i++) {
+      var coordSysKey = coordSysKeyArr[i];
+      var coordSysRecord = coordSysRecordMap.get(coordSysKey);
+      var dataZoomInfoMap = coordSysRecord.dataZoomInfoMap;
+
+      if (dataZoomInfoMap) {
+        var dzUid = dataZoomModel.uid;
+        var dzInfo = dataZoomInfoMap.get(dzUid);
+
+        if (dzInfo) {
+          dataZoomInfoMap.removeKey(dzUid);
+
+          if (!dataZoomInfoMap.keys().length) {
+            disposeCoordSysRecord(coordSysRecordMap, coordSysRecord);
+          }
+        }
+      }
+    }
+  }
+
+  function disposeCoordSysRecord(coordSysRecordMap, coordSysRecord) {
+    if (coordSysRecord) {
+      coordSysRecordMap.removeKey(coordSysRecord.model.uid);
+      var controller = coordSysRecord.controller;
+      controller && controller.dispose();
+    }
+  }
+
+  function createCoordSysRecord(api, coordSysModel) {
+    // These init props will never change after record created.
+    var coordSysRecord = {
+      model: coordSysModel,
+      containsPoint: curry(containsPoint, coordSysModel),
+      dispatchAction: curry(dispatchAction, api),
+      dataZoomInfoMap: null,
+      controller: null
+    }; // Must not do anything depends on coordSysRecord outside the event handler here,
+    // because coordSysRecord not completed yet.
+
+    var controller = coordSysRecord.controller = new RoamController(api.getZr());
+    each(['pan', 'zoom', 'scrollMove'], function (eventName) {
+      controller.on(eventName, function (event) {
+        var batch = [];
+        coordSysRecord.dataZoomInfoMap.each(function (dzInfo) {
+          // Check whether the behaviors (zoomOnMouseWheel, moveOnMouseMove,
+          // moveOnMouseWheel, ...) enabled.
+          if (!event.isAvailableBehavior(dzInfo.model.option)) {
+            return;
+          }
+
+          var method = (dzInfo.getRange || {})[eventName];
+          var range = method && method(dzInfo.dzReferCoordSysInfo, coordSysRecord.model.mainType, coordSysRecord.controller, event);
+          !dzInfo.model.get('disabled', true) && range && batch.push({
+            dataZoomId: dzInfo.model.id,
+            start: range[0],
+            end: range[1]
+          });
+        });
+        batch.length && coordSysRecord.dispatchAction(batch);
+      });
+    });
+    return coordSysRecord;
+  }
+  /**
+   * This action will be throttled.
+   */
+
+
+  function dispatchAction(api, batch) {
+    if (!api.isDisposed()) {
+      api.dispatchAction({
+        type: 'dataZoom',
+        animation: {
+          easing: 'cubicOut',
+          duration: 100
+        },
+        batch: batch
+      });
+    }
+  }
+
+  function containsPoint(coordSysModel, e, x, y) {
+    return coordSysModel.coordinateSystem.containPoint([x, y]);
+  }
+  /**
+   * Merge roamController settings when multiple dataZooms share one roamController.
+   */
+
+
+  function mergeControllerParams(dataZoomInfoMap) {
+    var controlType; // DO NOT use reserved word (true, false, undefined) as key literally. Even if encapsulated
+    // as string, it is probably revert to reserved word by compress tool. See #7411.
+
+    var prefix = 'type_';
+    var typePriority = {
+      'type_true': 2,
+      'type_move': 1,
+      'type_false': 0,
+      'type_undefined': -1
+    };
+    var preventDefaultMouseMove = true;
+    dataZoomInfoMap.each(function (dataZoomInfo) {
+      var dataZoomModel = dataZoomInfo.model;
+      var oneType = dataZoomModel.get('disabled', true) ? false : dataZoomModel.get('zoomLock', true) ? 'move' : true;
+
+      if (typePriority[prefix + oneType] > typePriority[prefix + controlType]) {
+        controlType = oneType;
+      } // Prevent default move event by default. If one false, do not prevent. Otherwise
+      // users may be confused why it does not work when multiple insideZooms exist.
+
+
+      preventDefaultMouseMove = preventDefaultMouseMove && dataZoomModel.get('preventDefaultMouseMove', true);
+    });
+    return {
+      controlType: controlType,
+      opt: {
+        // RoamController will enable all of these functionalities,
+        // and the final behavior is determined by its event listener
+        // provided by each inside zoom.
+        zoomOnMouseWheel: true,
+        moveOnMouseMove: true,
+        moveOnMouseWheel: true,
+        preventDefaultMouseMove: !!preventDefaultMouseMove
+      }
+    };
+  }
+
+  function installDataZoomRoamProcessor(registers) {
+    registers.registerProcessor(registers.PRIORITY.PROCESSOR.FILTER, function (ecModel, api) {
+      var apiInner = inner$12(api);
+      var coordSysRecordMap = apiInner.coordSysRecordMap || (apiInner.coordSysRecordMap = createHashMap());
+      coordSysRecordMap.each(function (coordSysRecord) {
+        // `coordSysRecordMap` always exists (because it holds the `roam controller`, which should
+        // better not re-create each time), but clear `dataZoomInfoMap` each round of the workflow.
+        coordSysRecord.dataZoomInfoMap = null;
+      });
+      ecModel.eachComponent({
+        mainType: 'dataZoom',
+        subType: 'inside'
+      }, function (dataZoomModel) {
+        var dzReferCoordSysWrap = collectReferCoordSysModelInfo(dataZoomModel);
+        each(dzReferCoordSysWrap.infoList, function (dzCoordSysInfo) {
+          var coordSysUid = dzCoordSysInfo.model.uid;
+          var coordSysRecord = coordSysRecordMap.get(coordSysUid) || coordSysRecordMap.set(coordSysUid, createCoordSysRecord(api, dzCoordSysInfo.model));
+          var dataZoomInfoMap = coordSysRecord.dataZoomInfoMap || (coordSysRecord.dataZoomInfoMap = createHashMap()); // Notice these props might be changed each time for a single dataZoomModel.
+
+          dataZoomInfoMap.set(dataZoomModel.uid, {
+            dzReferCoordSysInfo: dzCoordSysInfo,
+            model: dataZoomModel,
+            getRange: null
+          });
+        });
+      }); // (1) Merge dataZoom settings for each coord sys and set to the roam controller.
+      // (2) Clear coord sys if not refered by any dataZoom.
+
+      coordSysRecordMap.each(function (coordSysRecord) {
+        var controller = coordSysRecord.controller;
+        var firstDzInfo;
+        var dataZoomInfoMap = coordSysRecord.dataZoomInfoMap;
+
+        if (dataZoomInfoMap) {
+          var firstDzKey = dataZoomInfoMap.keys()[0];
+
+          if (firstDzKey != null) {
+            firstDzInfo = dataZoomInfoMap.get(firstDzKey);
+          }
+        }
+
+        if (!firstDzInfo) {
+          disposeCoordSysRecord(coordSysRecordMap, coordSysRecord);
+          return;
+        }
+
+        var controllerParams = mergeControllerParams(dataZoomInfoMap);
+        controller.enable(controllerParams.controlType, controllerParams.opt);
+        controller.setPointerChecker(coordSysRecord.containsPoint);
+        createOrUpdate(coordSysRecord, 'dispatchAction', firstDzInfo.model.get('throttle', true), 'fixRate');
+      });
+    });
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var InsideZoomView =
+  /** @class */
+  function (_super) {
+    __extends(InsideZoomView, _super);
+
+    function InsideZoomView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = 'dataZoom.inside';
+      return _this;
+    }
+
+    InsideZoomView.prototype.render = function (dataZoomModel, ecModel, api) {
+      _super.prototype.render.apply(this, arguments);
+
+      if (dataZoomModel.noTarget()) {
+        this._clear();
+
+        return;
+      } // Hence the `throttle` util ensures to preserve command order,
+      // here simply updating range all the time will not cause missing
+      // any of the the roam change.
+
+
+      this.range = dataZoomModel.getPercentRange(); // Reset controllers.
+
+      setViewInfoToCoordSysRecord(api, dataZoomModel, {
+        pan: bind(getRangeHandlers.pan, this),
+        zoom: bind(getRangeHandlers.zoom, this),
+        scrollMove: bind(getRangeHandlers.scrollMove, this)
+      });
+    };
+
+    InsideZoomView.prototype.dispose = function () {
+      this._clear();
+
+      _super.prototype.dispose.apply(this, arguments);
+    };
+
+    InsideZoomView.prototype._clear = function () {
+      disposeCoordSysRecordIfNeeded(this.api, this.dataZoomModel);
+      this.range = null;
+    };
+
+    InsideZoomView.type = 'dataZoom.inside';
+    return InsideZoomView;
+  }(DataZoomView);
+
+  var getRangeHandlers = {
+    zoom: function (coordSysInfo, coordSysMainType, controller, e) {
+      var lastRange = this.range;
+      var range = lastRange.slice(); // Calculate transform by the first axis.
+
+      var axisModel = coordSysInfo.axisModels[0];
+
+      if (!axisModel) {
+        return;
+      }
+
+      var directionInfo = getDirectionInfo[coordSysMainType](null, [e.originX, e.originY], axisModel, controller, coordSysInfo);
+      var percentPoint = (directionInfo.signal > 0 ? directionInfo.pixelStart + directionInfo.pixelLength - directionInfo.pixel : directionInfo.pixel - directionInfo.pixelStart) / directionInfo.pixelLength * (range[1] - range[0]) + range[0];
+      var scale = Math.max(1 / e.scale, 0);
+      range[0] = (range[0] - percentPoint) * scale + percentPoint;
+      range[1] = (range[1] - percentPoint) * scale + percentPoint; // Restrict range.
+
+      var minMaxSpan = this.dataZoomModel.findRepresentativeAxisProxy().getMinMaxSpan();
+      sliderMove(0, range, [0, 100], 0, minMaxSpan.minSpan, minMaxSpan.maxSpan);
+      this.range = range;
+
+      if (lastRange[0] !== range[0] || lastRange[1] !== range[1]) {
+        return range;
+      }
+    },
+    pan: makeMover(function (range, axisModel, coordSysInfo, coordSysMainType, controller, e) {
+      var directionInfo = getDirectionInfo[coordSysMainType]([e.oldX, e.oldY], [e.newX, e.newY], axisModel, controller, coordSysInfo);
+      return directionInfo.signal * (range[1] - range[0]) * directionInfo.pixel / directionInfo.pixelLength;
+    }),
+    scrollMove: makeMover(function (range, axisModel, coordSysInfo, coordSysMainType, controller, e) {
+      var directionInfo = getDirectionInfo[coordSysMainType]([0, 0], [e.scrollDelta, e.scrollDelta], axisModel, controller, coordSysInfo);
+      return directionInfo.signal * (range[1] - range[0]) * e.scrollDelta;
+    })
+  };
+
+  function makeMover(getPercentDelta) {
+    return function (coordSysInfo, coordSysMainType, controller, e) {
+      var lastRange = this.range;
+      var range = lastRange.slice(); // Calculate transform by the first axis.
+
+      var axisModel = coordSysInfo.axisModels[0];
+
+      if (!axisModel) {
+        return;
+      }
+
+      var percentDelta = getPercentDelta(range, axisModel, coordSysInfo, coordSysMainType, controller, e);
+      sliderMove(percentDelta, range, [0, 100], 'all');
+      this.range = range;
+
+      if (lastRange[0] !== range[0] || lastRange[1] !== range[1]) {
+        return range;
+      }
+    };
+  }
+
+  var getDirectionInfo = {
+    grid: function (oldPoint, newPoint, axisModel, controller, coordSysInfo) {
+      var axis = axisModel.axis;
+      var ret = {};
+      var rect = coordSysInfo.model.coordinateSystem.getRect();
+      oldPoint = oldPoint || [0, 0];
+
+      if (axis.dim === 'x') {
+        ret.pixel = newPoint[0] - oldPoint[0];
+        ret.pixelLength = rect.width;
+        ret.pixelStart = rect.x;
+        ret.signal = axis.inverse ? 1 : -1;
+      } else {
+        // axis.dim === 'y'
+        ret.pixel = newPoint[1] - oldPoint[1];
+        ret.pixelLength = rect.height;
+        ret.pixelStart = rect.y;
+        ret.signal = axis.inverse ? -1 : 1;
+      }
+
+      return ret;
+    },
+    polar: function (oldPoint, newPoint, axisModel, controller, coordSysInfo) {
+      var axis = axisModel.axis;
+      var ret = {};
+      var polar = coordSysInfo.model.coordinateSystem;
+      var radiusExtent = polar.getRadiusAxis().getExtent();
+      var angleExtent = polar.getAngleAxis().getExtent();
+      oldPoint = oldPoint ? polar.pointToCoord(oldPoint) : [0, 0];
+      newPoint = polar.pointToCoord(newPoint);
+
+      if (axisModel.mainType === 'radiusAxis') {
+        ret.pixel = newPoint[0] - oldPoint[0]; // ret.pixelLength = Math.abs(radiusExtent[1] - radiusExtent[0]);
+        // ret.pixelStart = Math.min(radiusExtent[0], radiusExtent[1]);
+
+        ret.pixelLength = radiusExtent[1] - radiusExtent[0];
+        ret.pixelStart = radiusExtent[0];
+        ret.signal = axis.inverse ? 1 : -1;
+      } else {
+        // 'angleAxis'
+        ret.pixel = newPoint[1] - oldPoint[1]; // ret.pixelLength = Math.abs(angleExtent[1] - angleExtent[0]);
+        // ret.pixelStart = Math.min(angleExtent[0], angleExtent[1]);
+
+        ret.pixelLength = angleExtent[1] - angleExtent[0];
+        ret.pixelStart = angleExtent[0];
+        ret.signal = axis.inverse ? -1 : 1;
+      }
+
+      return ret;
+    },
+    singleAxis: function (oldPoint, newPoint, axisModel, controller, coordSysInfo) {
+      var axis = axisModel.axis;
+      var rect = coordSysInfo.model.coordinateSystem.getRect();
+      var ret = {};
+      oldPoint = oldPoint || [0, 0];
+
+      if (axis.orient === 'horizontal') {
+        ret.pixel = newPoint[0] - oldPoint[0];
+        ret.pixelLength = rect.width;
+        ret.pixelStart = rect.x;
+        ret.signal = axis.inverse ? 1 : -1;
+      } else {
+        // 'vertical'
+        ret.pixel = newPoint[1] - oldPoint[1];
+        ret.pixelLength = rect.height;
+        ret.pixelStart = rect.y;
+        ret.signal = axis.inverse ? -1 : 1;
+      }
+
+      return ret;
+    }
+  };
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  var each$4 = each;
+  var asc$1 = asc;
+  /**
+   * Operate single axis.
+   * One axis can only operated by one axis operator.
+   * Different dataZoomModels may be defined to operate the same axis.
+   * (i.e. 'inside' data zoom and 'slider' data zoom components)
+   * So dataZoomModels share one axisProxy in that case.
+   */
+
+  var AxisProxy =
+  /** @class */
+  function () {
+    function AxisProxy(dimName, axisIndex, dataZoomModel, ecModel) {
+      this._dimName = dimName;
+      this._axisIndex = axisIndex;
+      this.ecModel = ecModel;
+      this._dataZoomModel = dataZoomModel; // /**
+      //  * @readOnly
+      //  * @private
+      //  */
+      // this.hasSeriesStacked;
+    }
+    /**
+     * Whether the axisProxy is hosted by dataZoomModel.
+     */
+
+
+    AxisProxy.prototype.hostedBy = function (dataZoomModel) {
+      return this._dataZoomModel === dataZoomModel;
+    };
+    /**
+     * @return Value can only be NaN or finite value.
+     */
+
+
+    AxisProxy.prototype.getDataValueWindow = function () {
+      return this._valueWindow.slice();
+    };
+    /**
+     * @return {Array.<number>}
+     */
+
+
+    AxisProxy.prototype.getDataPercentWindow = function () {
+      return this._percentWindow.slice();
+    };
+
+    AxisProxy.prototype.getTargetSeriesModels = function () {
+      var seriesModels = [];
+      this.ecModel.eachSeries(function (seriesModel) {
+        if (isCoordSupported(seriesModel)) {
+          var axisMainType = getAxisMainType(this._dimName);
+          var axisModel = seriesModel.getReferringComponents(axisMainType, SINGLE_REFERRING).models[0];
+
+          if (axisModel && this._axisIndex === axisModel.componentIndex) {
+            seriesModels.push(seriesModel);
+          }
+        }
+      }, this);
+      return seriesModels;
+    };
+
+    AxisProxy.prototype.getAxisModel = function () {
+      return this.ecModel.getComponent(this._dimName + 'Axis', this._axisIndex);
+    };
+
+    AxisProxy.prototype.getMinMaxSpan = function () {
+      return clone(this._minMaxSpan);
+    };
+    /**
+     * Only calculate by given range and this._dataExtent, do not change anything.
+     */
+
+
+    AxisProxy.prototype.calculateDataWindow = function (opt) {
+      var dataExtent = this._dataExtent;
+      var axisModel = this.getAxisModel();
+      var scale = axisModel.axis.scale;
+
+      var rangePropMode = this._dataZoomModel.getRangePropMode();
+
+      var percentExtent = [0, 100];
+      var percentWindow = [];
+      var valueWindow = [];
+      var hasPropModeValue;
+      each$4(['start', 'end'], function (prop, idx) {
+        var boundPercent = opt[prop];
+        var boundValue = opt[prop + 'Value']; // Notice: dataZoom is based either on `percentProp` ('start', 'end') or
+        // on `valueProp` ('startValue', 'endValue'). (They are based on the data extent
+        // but not min/max of axis, which will be calculated by data window then).
+        // The former one is suitable for cases that a dataZoom component controls multiple
+        // axes with different unit or extent, and the latter one is suitable for accurate
+        // zoom by pixel (e.g., in dataZoomSelect).
+        // we use `getRangePropMode()` to mark which prop is used. `rangePropMode` is updated
+        // only when setOption or dispatchAction, otherwise it remains its original value.
+        // (Why not only record `percentProp` and always map to `valueProp`? Because
+        // the map `valueProp` -> `percentProp` -> `valueProp` probably not the original
+        // `valueProp`. consider two axes constrolled by one dataZoom. They have different
+        // data extent. All of values that are overflow the `dataExtent` will be calculated
+        // to percent '100%').
+
+        if (rangePropMode[idx] === 'percent') {
+          boundPercent == null && (boundPercent = percentExtent[idx]); // Use scale.parse to math round for category or time axis.
+
+          boundValue = scale.parse(linearMap(boundPercent, percentExtent, dataExtent));
+        } else {
+          hasPropModeValue = true;
+          boundValue = boundValue == null ? dataExtent[idx] : scale.parse(boundValue); // Calculating `percent` from `value` may be not accurate, because
+          // This calculation can not be inversed, because all of values that
+          // are overflow the `dataExtent` will be calculated to percent '100%'
+
+          boundPercent = linearMap(boundValue, dataExtent, percentExtent);
+        } // valueWindow[idx] = round(boundValue);
+        // percentWindow[idx] = round(boundPercent);
+        // fallback to extent start/end when parsed value or percent is invalid
+
+
+        valueWindow[idx] = boundValue == null || isNaN(boundValue) ? dataExtent[idx] : boundValue;
+        percentWindow[idx] = boundPercent == null || isNaN(boundPercent) ? percentExtent[idx] : boundPercent;
+      });
+      asc$1(valueWindow);
+      asc$1(percentWindow); // The windows from user calling of `dispatchAction` might be out of the extent,
+      // or do not obey the `min/maxSpan`, `min/maxValueSpan`. But we don't restrict window
+      // by `zoomLock` here, because we see `zoomLock` just as a interaction constraint,
+      // where API is able to initialize/modify the window size even though `zoomLock`
+      // specified.
+
+      var spans = this._minMaxSpan;
+      hasPropModeValue ? restrictSet(valueWindow, percentWindow, dataExtent, percentExtent, false) : restrictSet(percentWindow, valueWindow, percentExtent, dataExtent, true);
+
+      function restrictSet(fromWindow, toWindow, fromExtent, toExtent, toValue) {
+        var suffix = toValue ? 'Span' : 'ValueSpan';
+        sliderMove(0, fromWindow, fromExtent, 'all', spans['min' + suffix], spans['max' + suffix]);
+
+        for (var i = 0; i < 2; i++) {
+          toWindow[i] = linearMap(fromWindow[i], fromExtent, toExtent, true);
+          toValue && (toWindow[i] = scale.parse(toWindow[i]));
+        }
+      }
+
+      return {
+        valueWindow: valueWindow,
+        percentWindow: percentWindow
+      };
+    };
+    /**
+     * Notice: reset should not be called before series.restoreData() is called,
+     * so it is recommended to be called in "process stage" but not "model init
+     * stage".
+     */
+
+
+    AxisProxy.prototype.reset = function (dataZoomModel) {
+      if (dataZoomModel !== this._dataZoomModel) {
+        return;
+      }
+
+      var targetSeries = this.getTargetSeriesModels(); // Culculate data window and data extent, and record them.
+
+      this._dataExtent = calculateDataExtent(this, this._dimName, targetSeries); // `calculateDataWindow` uses min/maxSpan.
+
+      this._updateMinMaxSpan();
+
+      var dataWindow = this.calculateDataWindow(dataZoomModel.settledOption);
+      this._valueWindow = dataWindow.valueWindow;
+      this._percentWindow = dataWindow.percentWindow; // Update axis setting then.
+
+      this._setAxisModel();
+    };
+
+    AxisProxy.prototype.filterData = function (dataZoomModel, api) {
+      if (dataZoomModel !== this._dataZoomModel) {
+        return;
+      }
+
+      var axisDim = this._dimName;
+      var seriesModels = this.getTargetSeriesModels();
+      var filterMode = dataZoomModel.get('filterMode');
+      var valueWindow = this._valueWindow;
+
+      if (filterMode === 'none') {
+        return;
+      } // FIXME
+      // Toolbox may has dataZoom injected. And if there are stacked bar chart
+      // with NaN data, NaN will be filtered and stack will be wrong.
+      // So we need to force the mode to be set empty.
+      // In fect, it is not a big deal that do not support filterMode-'filter'
+      // when using toolbox#dataZoom, utill tooltip#dataZoom support "single axis
+      // selection" some day, which might need "adapt to data extent on the
+      // otherAxis", which is disabled by filterMode-'empty'.
+      // But currently, stack has been fixed to based on value but not index,
+      // so this is not an issue any more.
+      // let otherAxisModel = this.getOtherAxisModel();
+      // if (dataZoomModel.get('$fromToolbox')
+      //     && otherAxisModel
+      //     && otherAxisModel.hasSeriesStacked
+      // ) {
+      //     filterMode = 'empty';
+      // }
+      // TODO
+      // filterMode 'weakFilter' and 'empty' is not optimized for huge data yet.
+
+
+      each$4(seriesModels, function (seriesModel) {
+        var seriesData = seriesModel.getData();
+        var dataDims = seriesData.mapDimensionsAll(axisDim);
+
+        if (!dataDims.length) {
+          return;
+        }
+
+        if (filterMode === 'weakFilter') {
+          var store_1 = seriesData.getStore();
+          var dataDimIndices_1 = map(dataDims, function (dim) {
+            return seriesData.getDimensionIndex(dim);
+          }, seriesData);
+          seriesData.filterSelf(function (dataIndex) {
+            var leftOut;
+            var rightOut;
+            var hasValue;
+
+            for (var i = 0; i < dataDims.length; i++) {
+              var value = store_1.get(dataDimIndices_1[i], dataIndex);
+              var thisHasValue = !isNaN(value);
+              var thisLeftOut = value < valueWindow[0];
+              var thisRightOut = value > valueWindow[1];
+
+              if (thisHasValue && !thisLeftOut && !thisRightOut) {
+                return true;
+              }
+
+              thisHasValue && (hasValue = true);
+              thisLeftOut && (leftOut = true);
+              thisRightOut && (rightOut = true);
+            } // If both left out and right out, do not filter.
+
+
+            return hasValue && leftOut && rightOut;
+          });
+        } else {
+          each$4(dataDims, function (dim) {
+            if (filterMode === 'empty') {
+              seriesModel.setData(seriesData = seriesData.map(dim, function (value) {
+                return !isInWindow(value) ? NaN : value;
+              }));
+            } else {
+              var range = {};
+              range[dim] = valueWindow; // console.time('select');
+
+              seriesData.selectRange(range); // console.timeEnd('select');
+            }
+          });
+        }
+
+        each$4(dataDims, function (dim) {
+          seriesData.setApproximateExtent(valueWindow, dim);
+        });
+      });
+
+      function isInWindow(value) {
+        return value >= valueWindow[0] && value <= valueWindow[1];
+      }
+    };
+
+    AxisProxy.prototype._updateMinMaxSpan = function () {
+      var minMaxSpan = this._minMaxSpan = {};
+      var dataZoomModel = this._dataZoomModel;
+      var dataExtent = this._dataExtent;
+      each$4(['min', 'max'], function (minMax) {
+        var percentSpan = dataZoomModel.get(minMax + 'Span');
+        var valueSpan = dataZoomModel.get(minMax + 'ValueSpan');
+        valueSpan != null && (valueSpan = this.getAxisModel().axis.scale.parse(valueSpan)); // minValueSpan and maxValueSpan has higher priority than minSpan and maxSpan
+
+        if (valueSpan != null) {
+          percentSpan = linearMap(dataExtent[0] + valueSpan, dataExtent, [0, 100], true);
+        } else if (percentSpan != null) {
+          valueSpan = linearMap(percentSpan, [0, 100], dataExtent, true) - dataExtent[0];
+        }
+
+        minMaxSpan[minMax + 'Span'] = percentSpan;
+        minMaxSpan[minMax + 'ValueSpan'] = valueSpan;
+      }, this);
+    };
+
+    AxisProxy.prototype._setAxisModel = function () {
+      var axisModel = this.getAxisModel();
+      var percentWindow = this._percentWindow;
+      var valueWindow = this._valueWindow;
+
+      if (!percentWindow) {
+        return;
+      } // [0, 500]: arbitrary value, guess axis extent.
+
+
+      var precision = getPixelPrecision(valueWindow, [0, 500]);
+      precision = Math.min(precision, 20); // For value axis, if min/max/scale are not set, we just use the extent obtained
+      // by series data, which may be a little different from the extent calculated by
+      // `axisHelper.getScaleExtent`. But the different just affects the experience a
+      // little when zooming. So it will not be fixed until some users require it strongly.
+
+      var rawExtentInfo = axisModel.axis.scale.rawExtentInfo;
+
+      if (percentWindow[0] !== 0) {
+        rawExtentInfo.setDeterminedMinMax('min', +valueWindow[0].toFixed(precision));
+      }
+
+      if (percentWindow[1] !== 100) {
+        rawExtentInfo.setDeterminedMinMax('max', +valueWindow[1].toFixed(precision));
+      }
+
+      rawExtentInfo.freeze();
+    };
+
+    return AxisProxy;
+  }();
+
+  function calculateDataExtent(axisProxy, axisDim, seriesModels) {
+    var dataExtent = [Infinity, -Infinity];
+    each$4(seriesModels, function (seriesModel) {
+      unionAxisExtentFromData(dataExtent, seriesModel.getData(), axisDim);
+    }); // It is important to get "consistent" extent when more then one axes is
+    // controlled by a `dataZoom`, otherwise those axes will not be synchronized
+    // when zooming. But it is difficult to know what is "consistent", considering
+    // axes have different type or even different meanings (For example, two
+    // time axes are used to compare data of the same date in different years).
+    // So basically dataZoom just obtains extent by series.data (in category axis
+    // extent can be obtained from axis.data).
+    // Nevertheless, user can set min/max/scale on axes to make extent of axes
+    // consistent.
+
+    var axisModel = axisProxy.getAxisModel();
+    var rawExtentResult = ensureScaleRawExtentInfo(axisModel.axis.scale, axisModel, dataExtent).calculate();
+    return [rawExtentResult.min, rawExtentResult.max];
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var dataZoomProcessor = {
+    // `dataZoomProcessor` will only be performed in needed series. Consider if
+    // there is a line series and a pie series, it is better not to update the
+    // line series if only pie series is needed to be updated.
+    getTargetSeries: function (ecModel) {
+      function eachAxisModel(cb) {
+        ecModel.eachComponent('dataZoom', function (dataZoomModel) {
+          dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+            var axisModel = ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
+            cb(axisDim, axisIndex, axisModel, dataZoomModel);
+          });
+        });
+      } // FIXME: it brings side-effect to `getTargetSeries`.
+      // Prepare axis proxies.
+
+
+      eachAxisModel(function (axisDim, axisIndex, axisModel, dataZoomModel) {
+        // dispose all last axis proxy, in case that some axis are deleted.
+        axisModel.__dzAxisProxy = null;
+      });
+      var proxyList = [];
+      eachAxisModel(function (axisDim, axisIndex, axisModel, dataZoomModel) {
+        // Different dataZooms may constrol the same axis. In that case,
+        // an axisProxy serves both of them.
+        if (!axisModel.__dzAxisProxy) {
+          // Use the first dataZoomModel as the main model of axisProxy.
+          axisModel.__dzAxisProxy = new AxisProxy(axisDim, axisIndex, dataZoomModel, ecModel);
+          proxyList.push(axisModel.__dzAxisProxy);
+        }
+      });
+      var seriesModelMap = createHashMap();
+      each(proxyList, function (axisProxy) {
+        each(axisProxy.getTargetSeriesModels(), function (seriesModel) {
+          seriesModelMap.set(seriesModel.uid, seriesModel);
+        });
+      });
+      return seriesModelMap;
+    },
+    // Consider appendData, where filter should be performed. Because data process is
+    // in block mode currently, it is not need to worry about that the overallProgress
+    // execute every frame.
+    overallReset: function (ecModel, api) {
+      ecModel.eachComponent('dataZoom', function (dataZoomModel) {
+        // We calculate window and reset axis here but not in model
+        // init stage and not after action dispatch handler, because
+        // reset should be called after seriesData.restoreData.
+        dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+          dataZoomModel.getAxisProxy(axisDim, axisIndex).reset(dataZoomModel);
+        }); // Caution: data zoom filtering is order sensitive when using
+        // percent range and no min/max/scale set on axis.
+        // For example, we have dataZoom definition:
+        // [
+        //      {xAxisIndex: 0, start: 30, end: 70},
+        //      {yAxisIndex: 0, start: 20, end: 80}
+        // ]
+        // In this case, [20, 80] of y-dataZoom should be based on data
+        // that have filtered by x-dataZoom using range of [30, 70],
+        // but should not be based on full raw data. Thus sliding
+        // x-dataZoom will change both ranges of xAxis and yAxis,
+        // while sliding y-dataZoom will only change the range of yAxis.
+        // So we should filter x-axis after reset x-axis immediately,
+        // and then reset y-axis and filter y-axis.
+
+        dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+          dataZoomModel.getAxisProxy(axisDim, axisIndex).filterData(dataZoomModel, api);
+        });
+      });
+      ecModel.eachComponent('dataZoom', function (dataZoomModel) {
+        // Fullfill all of the range props so that user
+        // is able to get them from chart.getOption().
+        var axisProxy = dataZoomModel.findRepresentativeAxisProxy();
+
+        if (axisProxy) {
+          var percentRange = axisProxy.getDataPercentWindow();
+          var valueRange = axisProxy.getDataValueWindow();
+          dataZoomModel.setCalculatedRange({
+            start: percentRange[0],
+            end: percentRange[1],
+            startValue: valueRange[0],
+            endValue: valueRange[1]
+          });
+        }
+      });
+    }
+  };
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  function installDataZoomAction(registers) {
+    registers.registerAction('dataZoom', function (payload, ecModel) {
+      var effectedModels = findEffectedDataZooms(ecModel, payload);
+      each(effectedModels, function (dataZoomModel) {
+        dataZoomModel.setRawRange({
+          start: payload.start,
+          end: payload.end,
+          startValue: payload.startValue,
+          endValue: payload.endValue
+        });
+      });
+    });
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var installed = false;
+
+  function installCommon(registers) {
+    if (installed) {
+      return;
+    }
+
+    installed = true;
+    registers.registerProcessor(registers.PRIORITY.PROCESSOR.FILTER, dataZoomProcessor);
+    installDataZoomAction(registers);
+    registers.registerSubTypeDefaulter('dataZoom', function () {
+      // Default 'slider' when no type specified.
+      return 'slider';
+    });
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function install$11(registers) {
+    installCommon(registers);
+    registers.registerComponentModel(InsideZoomModel);
+    registers.registerComponentView(InsideZoomView);
+    installDataZoomRoamProcessor(registers);
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var SliderZoomModel =
+  /** @class */
+  function (_super) {
+    __extends(SliderZoomModel, _super);
+
+    function SliderZoomModel() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = SliderZoomModel.type;
+      return _this;
+    }
+
+    SliderZoomModel.type = 'dataZoom.slider';
+    SliderZoomModel.layoutMode = 'box';
+    SliderZoomModel.defaultOption = inheritDefaultOption(DataZoomModel.defaultOption, {
+      show: true,
+      // deault value can only be drived in view stage.
+      right: 'ph',
+      top: 'ph',
+      width: 'ph',
+      height: 'ph',
+      left: null,
+      bottom: null,
+      borderColor: '#d2dbee',
+      borderRadius: 3,
+      backgroundColor: 'rgba(47,69,84,0)',
+      // dataBackgroundColor: '#ddd',
+      dataBackground: {
+        lineStyle: {
+          color: '#d2dbee',
+          width: 0.5
+        },
+        areaStyle: {
+          color: '#d2dbee',
+          opacity: 0.2
+        }
+      },
+      selectedDataBackground: {
+        lineStyle: {
+          color: '#8fb0f7',
+          width: 0.5
+        },
+        areaStyle: {
+          color: '#8fb0f7',
+          opacity: 0.2
+        }
+      },
+      // Color of selected window.
+      fillerColor: 'rgba(135,175,274,0.2)',
+      handleIcon: 'path://M-9.35,34.56V42m0-40V9.5m-2,0h4a2,2,0,0,1,2,2v21a2,2,0,0,1-2,2h-4a2,2,0,0,1-2-2v-21A2,2,0,0,1-11.35,9.5Z',
+      // Percent of the slider height
+      handleSize: '100%',
+      handleStyle: {
+        color: '#fff',
+        borderColor: '#ACB8D1'
+      },
+      moveHandleSize: 7,
+      moveHandleIcon: 'path://M-320.9-50L-320.9-50c18.1,0,27.1,9,27.1,27.1V85.7c0,18.1-9,27.1-27.1,27.1l0,0c-18.1,0-27.1-9-27.1-27.1V-22.9C-348-41-339-50-320.9-50z M-212.3-50L-212.3-50c18.1,0,27.1,9,27.1,27.1V85.7c0,18.1-9,27.1-27.1,27.1l0,0c-18.1,0-27.1-9-27.1-27.1V-22.9C-239.4-41-230.4-50-212.3-50z M-103.7-50L-103.7-50c18.1,0,27.1,9,27.1,27.1V85.7c0,18.1-9,27.1-27.1,27.1l0,0c-18.1,0-27.1-9-27.1-27.1V-22.9C-130.9-41-121.8-50-103.7-50z',
+      moveHandleStyle: {
+        color: '#D2DBEE',
+        opacity: 0.7
+      },
+      showDetail: true,
+      showDataShadow: 'auto',
+      realtime: true,
+      zoomLock: false,
+      textStyle: {
+        color: '#6E7079'
+      },
+      brushSelect: true,
+      brushStyle: {
+        color: 'rgba(135,175,274,0.15)'
+      },
+      emphasis: {
+        handleStyle: {
+          borderColor: '#8FB0F7'
+        },
+        moveHandleStyle: {
+          color: '#8FB0F7'
+        }
+      }
+    });
+    return SliderZoomModel;
+  }(DataZoomModel);
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  var Rect$2 = Rect; // Constants
+
+  var DEFAULT_LOCATION_EDGE_GAP = 7;
+  var DEFAULT_FRAME_BORDER_WIDTH = 1;
+  var DEFAULT_FILLER_SIZE = 30;
+  var DEFAULT_MOVE_HANDLE_SIZE = 7;
+  var HORIZONTAL = 'horizontal';
+  var VERTICAL = 'vertical';
+  var LABEL_GAP = 5;
+  var SHOW_DATA_SHADOW_SERIES_TYPE = ['line', 'bar', 'candlestick', 'scatter'];
+  var REALTIME_ANIMATION_CONFIG = {
+    easing: 'cubicOut',
+    duration: 100,
+    delay: 0
+  };
+
+  var SliderZoomView =
+  /** @class */
+  function (_super) {
+    __extends(SliderZoomView, _super);
+
+    function SliderZoomView() {
+      var _this = _super !== null && _super.apply(this, arguments) || this;
+
+      _this.type = SliderZoomView.type;
+      _this._displayables = {};
+      return _this;
+    }
+
+    SliderZoomView.prototype.init = function (ecModel, api) {
+      this.api = api; // A unique handler for each dataZoom component
+
+      this._onBrush = bind(this._onBrush, this);
+      this._onBrushEnd = bind(this._onBrushEnd, this);
+    };
+
+    SliderZoomView.prototype.render = function (dataZoomModel, ecModel, api, payload) {
+      _super.prototype.render.apply(this, arguments);
+
+      createOrUpdate(this, '_dispatchZoomAction', dataZoomModel.get('throttle'), 'fixRate');
+      this._orient = dataZoomModel.getOrient();
+
+      if (dataZoomModel.get('show') === false) {
+        this.group.removeAll();
+        return;
+      }
+
+      if (dataZoomModel.noTarget()) {
+        this._clear();
+
+        this.group.removeAll();
+        return;
+      } // Notice: this._resetInterval() should not be executed when payload.type
+      // is 'dataZoom', origin this._range should be maintained, otherwise 'pan'
+      // or 'zoom' info will be missed because of 'throttle' of this.dispatchAction,
+
+
+      if (!payload || payload.type !== 'dataZoom' || payload.from !== this.uid) {
+        this._buildView();
+      }
+
+      this._updateView();
+    };
+
+    SliderZoomView.prototype.dispose = function () {
+      this._clear();
+
+      _super.prototype.dispose.apply(this, arguments);
+    };
+
+    SliderZoomView.prototype._clear = function () {
+      clear(this, '_dispatchZoomAction');
+      var zr = this.api.getZr();
+      zr.off('mousemove', this._onBrush);
+      zr.off('mouseup', this._onBrushEnd);
+    };
+
+    SliderZoomView.prototype._buildView = function () {
+      var thisGroup = this.group;
+      thisGroup.removeAll();
+      this._brushing = false;
+      this._displayables.brushRect = null;
+
+      this._resetLocation();
+
+      this._resetInterval();
+
+      var barGroup = this._displayables.sliderGroup = new Group();
+
+      this._renderBackground();
+
+      this._renderHandle();
+
+      this._renderDataShadow();
+
+      thisGroup.add(barGroup);
+
+      this._positionGroup();
+    };
+
+    SliderZoomView.prototype._resetLocation = function () {
+      var dataZoomModel = this.dataZoomModel;
+      var api = this.api;
+      var showMoveHandle = dataZoomModel.get('brushSelect');
+      var moveHandleSize = showMoveHandle ? DEFAULT_MOVE_HANDLE_SIZE : 0; // If some of x/y/width/height are not specified,
+      // auto-adapt according to target grid.
+
+      var coordRect = this._findCoordRect();
+
+      var ecSize = {
+        width: api.getWidth(),
+        height: api.getHeight()
+      }; // Default align by coordinate system rect.
+
+      var positionInfo = this._orient === HORIZONTAL ? {
+        // Why using 'right', because right should be used in vertical,
+        // and it is better to be consistent for dealing with position param merge.
+        right: ecSize.width - coordRect.x - coordRect.width,
+        top: ecSize.height - DEFAULT_FILLER_SIZE - DEFAULT_LOCATION_EDGE_GAP - moveHandleSize,
+        width: coordRect.width,
+        height: DEFAULT_FILLER_SIZE
+      } : {
+        right: DEFAULT_LOCATION_EDGE_GAP,
+        top: coordRect.y,
+        width: DEFAULT_FILLER_SIZE,
+        height: coordRect.height
+      }; // Do not write back to option and replace value 'ph', because
+      // the 'ph' value should be recalculated when resize.
+
+      var layoutParams = getLayoutParams(dataZoomModel.option); // Replace the placeholder value.
+
+      each(['right', 'top', 'width', 'height'], function (name) {
+        if (layoutParams[name] === 'ph') {
+          layoutParams[name] = positionInfo[name];
+        }
+      });
+      var layoutRect = getLayoutRect(layoutParams, ecSize);
+      this._location = {
+        x: layoutRect.x,
+        y: layoutRect.y
+      };
+      this._size = [layoutRect.width, layoutRect.height];
+      this._orient === VERTICAL && this._size.reverse();
+    };
+
+    SliderZoomView.prototype._positionGroup = function () {
+      var thisGroup = this.group;
+      var location = this._location;
+      var orient = this._orient; // Just use the first axis to determine mapping.
+
+      var targetAxisModel = this.dataZoomModel.getFirstTargetAxisModel();
+      var inverse = targetAxisModel && targetAxisModel.get('inverse');
+      var sliderGroup = this._displayables.sliderGroup;
+      var otherAxisInverse = (this._dataShadowInfo || {}).otherAxisInverse; // Transform barGroup.
+
+      sliderGroup.attr(orient === HORIZONTAL && !inverse ? {
+        scaleY: otherAxisInverse ? 1 : -1,
+        scaleX: 1
+      } : orient === HORIZONTAL && inverse ? {
+        scaleY: otherAxisInverse ? 1 : -1,
+        scaleX: -1
+      } : orient === VERTICAL && !inverse ? {
+        scaleY: otherAxisInverse ? -1 : 1,
+        scaleX: 1,
+        rotation: Math.PI / 2
+      } // Dont use Math.PI, considering shadow direction.
+      : {
+        scaleY: otherAxisInverse ? -1 : 1,
+        scaleX: -1,
+        rotation: Math.PI / 2
+      }); // Position barGroup
+
+      var rect = thisGroup.getBoundingRect([sliderGroup]);
+      thisGroup.x = location.x - rect.x;
+      thisGroup.y = location.y - rect.y;
+      thisGroup.markRedraw();
+    };
+
+    SliderZoomView.prototype._getViewExtent = function () {
+      return [0, this._size[0]];
+    };
+
+    SliderZoomView.prototype._renderBackground = function () {
+      var dataZoomModel = this.dataZoomModel;
+      var size = this._size;
+      var barGroup = this._displayables.sliderGroup;
+      var brushSelect = dataZoomModel.get('brushSelect');
+      barGroup.add(new Rect$2({
+        silent: true,
+        shape: {
+          x: 0,
+          y: 0,
+          width: size[0],
+          height: size[1]
+        },
+        style: {
+          fill: dataZoomModel.get('backgroundColor')
+        },
+        z2: -40
+      })); // Click panel, over shadow, below handles.
+
+      var clickPanel = new Rect$2({
+        shape: {
+          x: 0,
+          y: 0,
+          width: size[0],
+          height: size[1]
+        },
+        style: {
+          fill: 'transparent'
+        },
+        z2: 0,
+        onclick: bind(this._onClickPanel, this)
+      });
+      var zr = this.api.getZr();
+
+      if (brushSelect) {
+        clickPanel.on('mousedown', this._onBrushStart, this);
+        clickPanel.cursor = 'crosshair';
+        zr.on('mousemove', this._onBrush);
+        zr.on('mouseup', this._onBrushEnd);
+      } else {
+        zr.off('mousemove', this._onBrush);
+        zr.off('mouseup', this._onBrushEnd);
+      }
+
+      barGroup.add(clickPanel);
+    };
+
+    SliderZoomView.prototype._renderDataShadow = function () {
+      var info = this._dataShadowInfo = this._prepareDataShadowInfo();
+
+      this._displayables.dataShadowSegs = [];
+
+      if (!info) {
+        return;
+      }
+
+      var size = this._size;
+      var oldSize = this._shadowSize || [];
+      var seriesModel = info.series;
+      var data = seriesModel.getRawData();
+      var candlestickDim = seriesModel.getShadowDim && seriesModel.getShadowDim();
+      var otherDim = candlestickDim && data.getDimensionInfo(candlestickDim) ? seriesModel.getShadowDim() // @see candlestick
+      : info.otherDim;
+
+      if (otherDim == null) {
+        return;
+      }
+
+      var polygonPts = this._shadowPolygonPts;
+      var polylinePts = this._shadowPolylinePts; // Not re-render if data doesn't change.
+
+      if (data !== this._shadowData || otherDim !== this._shadowDim || size[0] !== oldSize[0] || size[1] !== oldSize[1]) {
+        var otherDataExtent_1 = data.getDataExtent(otherDim); // Nice extent.
+
+        var otherOffset = (otherDataExtent_1[1] - otherDataExtent_1[0]) * 0.3;
+        otherDataExtent_1 = [otherDataExtent_1[0] - otherOffset, otherDataExtent_1[1] + otherOffset];
+        var otherShadowExtent_1 = [0, size[1]];
+        var thisShadowExtent = [0, size[0]];
+        var areaPoints_1 = [[size[0], 0], [0, 0]];
+        var linePoints_1 = [];
+        var step_1 = thisShadowExtent[1] / (data.count() - 1);
+        var thisCoord_1 = 0; // Optimize for large data shadow
+
+        var stride_1 = Math.round(data.count() / size[0]);
+        var lastIsEmpty_1;
+        data.each([otherDim], function (value, index) {
+          if (stride_1 > 0 && index % stride_1) {
+            thisCoord_1 += step_1;
+            return;
+          } // FIXME
+          // Should consider axis.min/axis.max when drawing dataShadow.
+          // FIXME
+          // 应该使用统一的空判断？还是在list里进行空判断？
+
+
+          var isEmpty = value == null || isNaN(value) || value === ''; // See #4235.
+
+          var otherCoord = isEmpty ? 0 : linearMap(value, otherDataExtent_1, otherShadowExtent_1, true); // Attempt to draw data shadow precisely when there are empty value.
+
+          if (isEmpty && !lastIsEmpty_1 && index) {
+            areaPoints_1.push([areaPoints_1[areaPoints_1.length - 1][0], 0]);
+            linePoints_1.push([linePoints_1[linePoints_1.length - 1][0], 0]);
+          } else if (!isEmpty && lastIsEmpty_1) {
+            areaPoints_1.push([thisCoord_1, 0]);
+            linePoints_1.push([thisCoord_1, 0]);
+          }
+
+          areaPoints_1.push([thisCoord_1, otherCoord]);
+          linePoints_1.push([thisCoord_1, otherCoord]);
+          thisCoord_1 += step_1;
+          lastIsEmpty_1 = isEmpty;
+        });
+        polygonPts = this._shadowPolygonPts = areaPoints_1;
+        polylinePts = this._shadowPolylinePts = linePoints_1;
+      }
+
+      this._shadowData = data;
+      this._shadowDim = otherDim;
+      this._shadowSize = [size[0], size[1]];
+      var dataZoomModel = this.dataZoomModel;
+
+      function createDataShadowGroup(isSelectedArea) {
+        var model = dataZoomModel.getModel(isSelectedArea ? 'selectedDataBackground' : 'dataBackground');
+        var group = new Group();
+        var polygon = new Polygon({
+          shape: {
+            points: polygonPts
+          },
+          segmentIgnoreThreshold: 1,
+          style: model.getModel('areaStyle').getAreaStyle(),
+          silent: true,
+          z2: -20
+        });
+        var polyline = new Polyline({
+          shape: {
+            points: polylinePts
+          },
+          segmentIgnoreThreshold: 1,
+          style: model.getModel('lineStyle').getLineStyle(),
+          silent: true,
+          z2: -19
+        });
+        group.add(polygon);
+        group.add(polyline);
+        return group;
+      } // let dataBackgroundModel = dataZoomModel.getModel('dataBackground');
+
+
+      for (var i = 0; i < 3; i++) {
+        var group = createDataShadowGroup(i === 1);
+
+        this._displayables.sliderGroup.add(group);
+
+        this._displayables.dataShadowSegs.push(group);
+      }
+    };
+
+    SliderZoomView.prototype._prepareDataShadowInfo = function () {
+      var dataZoomModel = this.dataZoomModel;
+      var showDataShadow = dataZoomModel.get('showDataShadow');
+
+      if (showDataShadow === false) {
+        return;
+      } // Find a representative series.
+
+
+      var result;
+      var ecModel = this.ecModel;
+      dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
+        var seriesModels = dataZoomModel.getAxisProxy(axisDim, axisIndex).getTargetSeriesModels();
+        each(seriesModels, function (seriesModel) {
+          if (result) {
+            return;
+          }
+
+          if (showDataShadow !== true && indexOf(SHOW_DATA_SHADOW_SERIES_TYPE, seriesModel.get('type')) < 0) {
+            return;
+          }
+
+          var thisAxis = ecModel.getComponent(getAxisMainType(axisDim), axisIndex).axis;
+          var otherDim = getOtherDim(axisDim);
+          var otherAxisInverse;
+          var coordSys = seriesModel.coordinateSystem;
+
+          if (otherDim != null && coordSys.getOtherAxis) {
+            otherAxisInverse = coordSys.getOtherAxis(thisAxis).inverse;
+          }
+
+          otherDim = seriesModel.getData().mapDimension(otherDim);
+          result = {
+            thisAxis: thisAxis,
+            series: seriesModel,
+            thisDim: axisDim,
+            otherDim: otherDim,
+            otherAxisInverse: otherAxisInverse
+          };
+        }, this);
+      }, this);
+      return result;
+    };
+
+    SliderZoomView.prototype._renderHandle = function () {
+      var thisGroup = this.group;
+      var displayables = this._displayables;
+      var handles = displayables.handles = [null, null];
+      var handleLabels = displayables.handleLabels = [null, null];
+      var sliderGroup = this._displayables.sliderGroup;
+      var size = this._size;
+      var dataZoomModel = this.dataZoomModel;
+      var api = this.api;
+      var borderRadius = dataZoomModel.get('borderRadius') || 0;
+      var brushSelect = dataZoomModel.get('brushSelect');
+      var filler = displayables.filler = new Rect$2({
+        silent: brushSelect,
+        style: {
+          fill: dataZoomModel.get('fillerColor')
+        },
+        textConfig: {
+          position: 'inside'
+        }
+      });
+      sliderGroup.add(filler); // Frame border.
+
+      sliderGroup.add(new Rect$2({
+        silent: true,
+        subPixelOptimize: true,
+        shape: {
+          x: 0,
+          y: 0,
+          width: size[0],
+          height: size[1],
+          r: borderRadius
+        },
+        style: {
+          // deprecated option
+          stroke: dataZoomModel.get('dataBackgroundColor') || dataZoomModel.get('borderColor'),
+          lineWidth: DEFAULT_FRAME_BORDER_WIDTH,
+          fill: 'rgba(0,0,0,0)'
+        }
+      })); // Left and right handle to resize
+
+      each([0, 1], function (handleIndex) {
+        var iconStr = dataZoomModel.get('handleIcon');
+
+        if (!symbolBuildProxies[iconStr] && iconStr.indexOf('path://') < 0 && iconStr.indexOf('image://') < 0) {
+          // Compatitable with the old icon parsers. Which can use a path string without path://
+          iconStr = 'path://' + iconStr;
+          {
+            deprecateLog('handleIcon now needs \'path://\' prefix when using a path string');
+          }
+        }
+
+        var path = createSymbol(iconStr, -1, 0, 2, 2, null, true);
+        path.attr({
+          cursor: getCursor(this._orient),
+          draggable: true,
+          drift: bind(this._onDragMove, this, handleIndex),
+          ondragend: bind(this._onDragEnd, this),
+          onmouseover: bind(this._showDataInfo, this, true),
+          onmouseout: bind(this._showDataInfo, this, false),
+          z2: 5
+        });
+        var bRect = path.getBoundingRect();
+        var handleSize = dataZoomModel.get('handleSize');
+        this._handleHeight = parsePercent$1(handleSize, this._size[1]);
+        this._handleWidth = bRect.width / bRect.height * this._handleHeight;
+        path.setStyle(dataZoomModel.getModel('handleStyle').getItemStyle());
+        path.style.strokeNoScale = true;
+        path.rectHover = true;
+        path.ensureState('emphasis').style = dataZoomModel.getModel(['emphasis', 'handleStyle']).getItemStyle();
+        enableHoverEmphasis(path);
+        var handleColor = dataZoomModel.get('handleColor'); // deprecated option
+        // Compatitable with previous version
+
+        if (handleColor != null) {
+          path.style.fill = handleColor;
+        }
+
+        sliderGroup.add(handles[handleIndex] = path);
+        var textStyleModel = dataZoomModel.getModel('textStyle');
+        thisGroup.add(handleLabels[handleIndex] = new ZRText({
+          silent: true,
+          invisible: true,
+          style: createTextStyle(textStyleModel, {
+            x: 0,
+            y: 0,
+            text: '',
+            verticalAlign: 'middle',
+            align: 'center',
+            fill: textStyleModel.getTextColor(),
+            font: textStyleModel.getFont()
+          }),
+          z2: 10
+        }));
+      }, this); // Handle to move. Only visible when brushSelect is set true.
+
+      var actualMoveZone = filler;
+
+      if (brushSelect) {
+        var moveHandleHeight = parsePercent$1(dataZoomModel.get('moveHandleSize'), size[1]);
+        var moveHandle_1 = displayables.moveHandle = new Rect({
+          style: dataZoomModel.getModel('moveHandleStyle').getItemStyle(),
+          silent: true,
+          shape: {
+            r: [0, 0, 2, 2],
+            y: size[1] - 0.5,
+            height: moveHandleHeight
+          }
+        });
+        var iconSize = moveHandleHeight * 0.8;
+        var moveHandleIcon = displayables.moveHandleIcon = createSymbol(dataZoomModel.get('moveHandleIcon'), -iconSize / 2, -iconSize / 2, iconSize, iconSize, '#fff', true);
+        moveHandleIcon.silent = true;
+        moveHandleIcon.y = size[1] + moveHandleHeight / 2 - 0.5;
+        moveHandle_1.ensureState('emphasis').style = dataZoomModel.getModel(['emphasis', 'moveHandleStyle']).getItemStyle();
+        var moveZoneExpandSize = Math.min(size[1] / 2, Math.max(moveHandleHeight, 10));
+        actualMoveZone = displayables.moveZone = new Rect({
+          invisible: true,
+          shape: {
+            y: size[1] - moveZoneExpandSize,
+            height: moveHandleHeight + moveZoneExpandSize
+          }
+        });
+        actualMoveZone.on('mouseover', function () {
+          api.enterEmphasis(moveHandle_1);
+        }).on('mouseout', function () {
+          api.leaveEmphasis(moveHandle_1);
+        });
+        sliderGroup.add(moveHandle_1);
+        sliderGroup.add(moveHandleIcon);
+        sliderGroup.add(actualMoveZone);
+      }
+
+      actualMoveZone.attr({
+        draggable: true,
+        cursor: getCursor(this._orient),
+        drift: bind(this._onDragMove, this, 'all'),
+        ondragstart: bind(this._showDataInfo, this, true),
+        ondragend: bind(this._onDragEnd, this),
+        onmouseover: bind(this._showDataInfo, this, true),
+        onmouseout: bind(this._showDataInfo, this, false)
+      });
+    };
+
+    SliderZoomView.prototype._resetInterval = function () {
+      var range = this._range = this.dataZoomModel.getPercentRange();
+
+      var viewExtent = this._getViewExtent();
+
+      this._handleEnds = [linearMap(range[0], [0, 100], viewExtent, true), linearMap(range[1], [0, 100], viewExtent, true)];
+    };
+
+    SliderZoomView.prototype._updateInterval = function (handleIndex, delta) {
+      var dataZoomModel = this.dataZoomModel;
+      var handleEnds = this._handleEnds;
+
+      var viewExtend = this._getViewExtent();
+
+      var minMaxSpan = dataZoomModel.findRepresentativeAxisProxy().getMinMaxSpan();
+      var percentExtent = [0, 100];
+      sliderMove(delta, handleEnds, viewExtend, dataZoomModel.get('zoomLock') ? 'all' : handleIndex, minMaxSpan.minSpan != null ? linearMap(minMaxSpan.minSpan, percentExtent, viewExtend, true) : null, minMaxSpan.maxSpan != null ? linearMap(minMaxSpan.maxSpan, percentExtent, viewExtend, true) : null);
+      var lastRange = this._range;
+      var range = this._range = asc([linearMap(handleEnds[0], viewExtend, percentExtent, true), linearMap(handleEnds[1], viewExtend, percentExtent, true)]);
+      return !lastRange || lastRange[0] !== range[0] || lastRange[1] !== range[1];
+    };
+
+    SliderZoomView.prototype._updateView = function (nonRealtime) {
+      var displaybles = this._displayables;
+      var handleEnds = this._handleEnds;
+      var handleInterval = asc(handleEnds.slice());
+      var size = this._size;
+      each([0, 1], function (handleIndex) {
+        // Handles
+        var handle = displaybles.handles[handleIndex];
+        var handleHeight = this._handleHeight;
+        handle.attr({
+          scaleX: handleHeight / 2,
+          scaleY: handleHeight / 2,
+          // This is a trick, by adding an extra tiny offset to let the default handle's end point align to the drag window.
+          // NOTE: It may affect some custom shapes a bit. But we prefer to have better result by default.
+          x: handleEnds[handleIndex] + (handleIndex ? -1 : 1),
+          y: size[1] / 2 - handleHeight / 2
+        });
+      }, this); // Filler
+
+      displaybles.filler.setShape({
+        x: handleInterval[0],
+        y: 0,
+        width: handleInterval[1] - handleInterval[0],
+        height: size[1]
+      });
+      var viewExtent = {
+        x: handleInterval[0],
+        width: handleInterval[1] - handleInterval[0]
+      }; // Move handle
+
+      if (displaybles.moveHandle) {
+        displaybles.moveHandle.setShape(viewExtent);
+        displaybles.moveZone.setShape(viewExtent); // Force update path on the invisible object
+
+        displaybles.moveZone.getBoundingRect();
+        displaybles.moveHandleIcon && displaybles.moveHandleIcon.attr('x', viewExtent.x + viewExtent.width / 2);
+      } // update clip path of shadow.
+
+
+      var dataShadowSegs = displaybles.dataShadowSegs;
+      var segIntervals = [0, handleInterval[0], handleInterval[1], size[0]];
+
+      for (var i = 0; i < dataShadowSegs.length; i++) {
+        var segGroup = dataShadowSegs[i];
+        var clipPath = segGroup.getClipPath();
+
+        if (!clipPath) {
+          clipPath = new Rect();
+          segGroup.setClipPath(clipPath);
+        }
+
+        clipPath.setShape({
+          x: segIntervals[i],
+          y: 0,
+          width: segIntervals[i + 1] - segIntervals[i],
+          height: size[1]
+        });
+      }
+
+      this._updateDataInfo(nonRealtime);
+    };
+
+    SliderZoomView.prototype._updateDataInfo = function (nonRealtime) {
+      var dataZoomModel = this.dataZoomModel;
+      var displaybles = this._displayables;
+      var handleLabels = displaybles.handleLabels;
+      var orient = this._orient;
+      var labelTexts = ['', '']; // FIXME
+      // date型，支持formatter，autoformatter（ec2 date.getAutoFormatter）
+
+      if (dataZoomModel.get('showDetail')) {
+        var axisProxy = dataZoomModel.findRepresentativeAxisProxy();
+
+        if (axisProxy) {
+          var axis = axisProxy.getAxisModel().axis;
+          var range = this._range;
+          var dataInterval = nonRealtime // See #4434, data and axis are not processed and reset yet in non-realtime mode.
+          ? axisProxy.calculateDataWindow({
+            start: range[0],
+            end: range[1]
+          }).valueWindow : axisProxy.getDataValueWindow();
+          labelTexts = [this._formatLabel(dataInterval[0], axis), this._formatLabel(dataInterval[1], axis)];
+        }
+      }
+
+      var orderedHandleEnds = asc(this._handleEnds.slice());
+      setLabel.call(this, 0);
+      setLabel.call(this, 1);
+
+      function setLabel(handleIndex) {
+        // Label
+        // Text should not transform by barGroup.
+        // Ignore handlers transform
+        var barTransform = getTransform(displaybles.handles[handleIndex].parent, this.group);
+        var direction = transformDirection(handleIndex === 0 ? 'right' : 'left', barTransform);
+        var offset = this._handleWidth / 2 + LABEL_GAP;
+        var textPoint = applyTransform$1([orderedHandleEnds[handleIndex] + (handleIndex === 0 ? -offset : offset), this._size[1] / 2], barTransform);
+        handleLabels[handleIndex].setStyle({
+          x: textPoint[0],
+          y: textPoint[1],
+          verticalAlign: orient === HORIZONTAL ? 'middle' : direction,
+          align: orient === HORIZONTAL ? direction : 'center',
+          text: labelTexts[handleIndex]
+        });
+      }
+    };
+
+    SliderZoomView.prototype._formatLabel = function (value, axis) {
+      var dataZoomModel = this.dataZoomModel;
+      var labelFormatter = dataZoomModel.get('labelFormatter');
+      var labelPrecision = dataZoomModel.get('labelPrecision');
+
+      if (labelPrecision == null || labelPrecision === 'auto') {
+        labelPrecision = axis.getPixelPrecision();
+      }
+
+      var valueStr = value == null || isNaN(value) ? '' // FIXME Glue code
+      : axis.type === 'category' || axis.type === 'time' ? axis.scale.getLabel({
+        value: Math.round(value)
+      }) // param of toFixed should less then 20.
+      : value.toFixed(Math.min(labelPrecision, 20));
+      return isFunction(labelFormatter) ? labelFormatter(value, valueStr) : isString(labelFormatter) ? labelFormatter.replace('{value}', valueStr) : valueStr;
+    };
+    /**
+     * @param showOrHide true: show, false: hide
+     */
+
+
+    SliderZoomView.prototype._showDataInfo = function (showOrHide) {
+      // Always show when drgging.
+      showOrHide = this._dragging || showOrHide;
+      var displayables = this._displayables;
+      var handleLabels = displayables.handleLabels;
+      handleLabels[0].attr('invisible', !showOrHide);
+      handleLabels[1].attr('invisible', !showOrHide); // Highlight move handle
+
+      displayables.moveHandle && this.api[showOrHide ? 'enterEmphasis' : 'leaveEmphasis'](displayables.moveHandle, 1);
+    };
+
+    SliderZoomView.prototype._onDragMove = function (handleIndex, dx, dy, event) {
+      this._dragging = true; // For mobile device, prevent screen slider on the button.
+
+      stop(event.event); // Transform dx, dy to bar coordination.
+
+      var barTransform = this._displayables.sliderGroup.getLocalTransform();
+
+      var vertex = applyTransform$1([dx, dy], barTransform, true);
+
+      var changed = this._updateInterval(handleIndex, vertex[0]);
+
+      var realtime = this.dataZoomModel.get('realtime');
+
+      this._updateView(!realtime); // Avoid dispatch dataZoom repeatly but range not changed,
+      // which cause bad visual effect when progressive enabled.
+
+
+      changed && realtime && this._dispatchZoomAction(true);
+    };
+
+    SliderZoomView.prototype._onDragEnd = function () {
+      this._dragging = false;
+
+      this._showDataInfo(false); // While in realtime mode and stream mode, dispatch action when
+      // drag end will cause the whole view rerender, which is unnecessary.
+
+
+      var realtime = this.dataZoomModel.get('realtime');
+      !realtime && this._dispatchZoomAction(false);
+    };
+
+    SliderZoomView.prototype._onClickPanel = function (e) {
+      var size = this._size;
+
+      var localPoint = this._displayables.sliderGroup.transformCoordToLocal(e.offsetX, e.offsetY);
+
+      if (localPoint[0] < 0 || localPoint[0] > size[0] || localPoint[1] < 0 || localPoint[1] > size[1]) {
+        return;
+      }
+
+      var handleEnds = this._handleEnds;
+      var center = (handleEnds[0] + handleEnds[1]) / 2;
+
+      var changed = this._updateInterval('all', localPoint[0] - center);
+
+      this._updateView();
+
+      changed && this._dispatchZoomAction(false);
+    };
+
+    SliderZoomView.prototype._onBrushStart = function (e) {
+      var x = e.offsetX;
+      var y = e.offsetY;
+      this._brushStart = new Point(x, y);
+      this._brushing = true;
+      this._brushStartTime = +new Date(); // this._updateBrushRect(x, y);
+    };
+
+    SliderZoomView.prototype._onBrushEnd = function (e) {
+      if (!this._brushing) {
+        return;
+      }
+
+      var brushRect = this._displayables.brushRect;
+      this._brushing = false;
+
+      if (!brushRect) {
+        return;
+      }
+
+      brushRect.attr('ignore', true);
+      var brushShape = brushRect.shape;
+      var brushEndTime = +new Date(); // console.log(brushEndTime - this._brushStartTime);
+
+      if (brushEndTime - this._brushStartTime < 200 && Math.abs(brushShape.width) < 5) {
+        // Will treat it as a click
+        return;
+      }
+
+      var viewExtend = this._getViewExtent();
+
+      var percentExtent = [0, 100];
+      this._range = asc([linearMap(brushShape.x, viewExtend, percentExtent, true), linearMap(brushShape.x + brushShape.width, viewExtend, percentExtent, true)]);
+      this._handleEnds = [brushShape.x, brushShape.x + brushShape.width];
+
+      this._updateView();
+
+      this._dispatchZoomAction(false);
+    };
+
+    SliderZoomView.prototype._onBrush = function (e) {
+      if (this._brushing) {
+        // For mobile device, prevent screen slider on the button.
+        stop(e.event);
+
+        this._updateBrushRect(e.offsetX, e.offsetY);
+      }
+    };
+
+    SliderZoomView.prototype._updateBrushRect = function (mouseX, mouseY) {
+      var displayables = this._displayables;
+      var dataZoomModel = this.dataZoomModel;
+      var brushRect = displayables.brushRect;
+
+      if (!brushRect) {
+        brushRect = displayables.brushRect = new Rect$2({
+          silent: true,
+          style: dataZoomModel.getModel('brushStyle').getItemStyle()
+        });
+        displayables.sliderGroup.add(brushRect);
+      }
+
+      brushRect.attr('ignore', false);
+      var brushStart = this._brushStart;
+      var sliderGroup = this._displayables.sliderGroup;
+      var endPoint = sliderGroup.transformCoordToLocal(mouseX, mouseY);
+      var startPoint = sliderGroup.transformCoordToLocal(brushStart.x, brushStart.y);
+      var size = this._size;
+      endPoint[0] = Math.max(Math.min(size[0], endPoint[0]), 0);
+      brushRect.setShape({
+        x: startPoint[0],
+        y: 0,
+        width: endPoint[0] - startPoint[0],
+        height: size[1]
+      });
+    };
+    /**
+     * This action will be throttled.
+     */
+
+
+    SliderZoomView.prototype._dispatchZoomAction = function (realtime) {
+      var range = this._range;
+      this.api.dispatchAction({
+        type: 'dataZoom',
+        from: this.uid,
+        dataZoomId: this.dataZoomModel.id,
+        animation: realtime ? REALTIME_ANIMATION_CONFIG : null,
+        start: range[0],
+        end: range[1]
+      });
+    };
+
+    SliderZoomView.prototype._findCoordRect = function () {
+      // Find the grid coresponding to the first axis referred by dataZoom.
+      var rect;
+      var coordSysInfoList = collectReferCoordSysModelInfo(this.dataZoomModel).infoList;
+
+      if (!rect && coordSysInfoList.length) {
+        var coordSys = coordSysInfoList[0].model.coordinateSystem;
+        rect = coordSys.getRect && coordSys.getRect();
+      }
+
+      if (!rect) {
+        var width = this.api.getWidth();
+        var height = this.api.getHeight();
+        rect = {
+          x: width * 0.2,
+          y: height * 0.2,
+          width: width * 0.6,
+          height: height * 0.6
+        };
+      }
+
+      return rect;
+    };
+
+    SliderZoomView.type = 'dataZoom.slider';
+    return SliderZoomView;
+  }(DataZoomView);
+
+  function getOtherDim(thisDim) {
+    // FIXME
+    // 这个逻辑和getOtherAxis里一致，但是写在这里是否不好
+    var map$$1 = {
+      x: 'y',
+      y: 'x',
+      radius: 'angle',
+      angle: 'radius'
+    };
+    return map$$1[thisDim];
+  }
+
+  function getCursor(orient) {
+    return orient === 'vertical' ? 'ns-resize' : 'ew-resize';
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function install$12(registers) {
+    registers.registerComponentModel(SliderZoomModel);
+    registers.registerComponentView(SliderZoomView);
+    installCommon(registers);
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  function install$10(registers) {
+    use(install$11);
+    use(install$12); // Do not install './dataZoomSelect',
+    // since it only work for toolbox dataZoom.
+  }
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+  /**
+   * AUTO-GENERATED FILE. DO NOT MODIFY.
+   */
+
+  /*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+  * regarding copyright ownership.  The ASF licenses this file
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+  *
+  *   http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing,
+  * software distributed under the License is distributed on an
+  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  * KIND, either express or implied.  See the License for the
+  * specific language governing permissions and limitations
+  * under the License.
+  */
+
+
+  use(install$10);
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -52056,11 +62136,11 @@
      * @public
      */
     get: function (visualType, key, isCategory) {
-      var value = clone((defaultOption[visualType] || {})[key]);
+      var value = clone((defaultOption$1[visualType] || {})[key]);
       return isCategory ? isArray(value) ? value[value.length - 1] : value : value;
     }
   };
-  var defaultOption = {
+  var defaultOption$1 = {
     color: {
       active: ['#006edd', '#e0ffff'],
       inactive: ['rgba(0,0,0,0)']
@@ -52136,7 +62216,7 @@
   * under the License.
   */
 
-  var each$5 = each;
+  var each$6 = each;
   var isObject$3 = isObject;
   var CATEGORY_DEFAULT_VISUAL_INDEX = -1;
 
@@ -52234,7 +62314,7 @@
     VisualMapping.retrieveVisuals = function (obj) {
       var ret = {};
       var hasVisual;
-      obj && each$5(VisualMapping.visualHandlers, function (h, visualType) {
+      obj && each$6(VisualMapping.visualHandlers, function (h, visualType) {
         if (obj.hasOwnProperty(visualType)) {
           ret[visualType] = obj[visualType];
           hasVisual = true;
@@ -52257,7 +62337,7 @@
         visualTypes = visualTypes.slice();
       } else if (isObject$3(visualTypes)) {
         var types_1 = [];
-        each$5(visualTypes, function (item, type) {
+        each$6(visualTypes, function (item, type) {
           types_1.push(type);
         });
         visualTypes = types_1;
@@ -52462,7 +62542,7 @@
     var categories = thisOption.categories;
     var categoryMap = thisOption.categoryMap = {};
     var visual = thisOption.visual;
-    each$5(categories, function (cate, index) {
+    each$6(categories, function (cate, index) {
       categoryMap[cate] = index;
     }); // Process visual map input.
 
@@ -52470,7 +62550,7 @@
       var visualArr_1 = [];
 
       if (isObject(visual)) {
-        each$5(visual, function (v, cate) {
+        each$6(visual, function (v, cate) {
           var index = categoryMap[cate];
           visualArr_1[index != null ? index : CATEGORY_DEFAULT_VISUAL_INDEX] = v;
         });
@@ -52497,7 +62577,7 @@
     var visualArr = [];
 
     if (isObject(visual)) {
-      each$5(visual, function (v) {
+      each$6(visual, function (v) {
         visualArr.push(v);
       });
     } else if (visual != null) {
@@ -52679,7 +62759,7 @@
    */
 
 
-  var each$6 = each;
+  var each$7 = each;
 
   function hasKeys(obj) {
     if (obj) {
@@ -52693,9 +62773,9 @@
 
   function createVisualMappings(option, stateList, supplementVisualOption) {
     var visualMappings = {};
-    each$6(stateList, function (state) {
+    each$7(stateList, function (state) {
       var mappings = visualMappings[state] = createMappings();
-      each$6(option[state], function (visualData, visualType) {
+      each$7(option[state], function (visualData, visualType) {
         if (!VisualMapping.isValidType(visualType)) {
           return;
         }
@@ -52858,8 +62938,8 @@
   var mapVisual = VisualMapping.mapVisual;
   var eachVisual = VisualMapping.eachVisual;
   var isArray$1 = isArray;
-  var each$4 = each;
-  var asc$1 = asc;
+  var each$5 = each;
+  var asc$2 = asc;
   var linearMap$1 = linearMap;
 
   var VisualMapModel =
@@ -53031,7 +63111,7 @@
       // Because series and data may be modified in processing stage.
       // So we do not support the feature "auto min/max".
 
-      var extent = asc$1([thisOption.min, thisOption.max]);
+      var extent = asc$2([thisOption.min, thisOption.max]);
       this._dataExtent = extent;
     };
     /**
@@ -53129,7 +63209,7 @@
 
         if (optExist && !optAbsent) {
           optAbsent = base[stateAbsent] = {};
-          each$4(optExist, function (visualData, visualType) {
+          each$5(optExist, function (visualData, visualType) {
             if (!VisualMapping.isValidType(visualType)) {
               return;
             }
@@ -53155,7 +63235,7 @@
         var inactiveColor = this.get('inactiveColor');
         var itemSymbol = this.getItemSymbol();
         var defaultSymbol = itemSymbol || 'roundRect';
-        each$4(this.stateList, function (state) {
+        each$5(this.stateList, function (state) {
           var itemSize = this.itemSize;
           var visuals = controller[state]; // Set inactive color for controller if no other color
           // attr (like colorAlpha) specified.
@@ -53776,130 +63856,6 @@
   * under the License.
   */
 
-  /**
-   * Calculate slider move result.
-   * Usage:
-   * (1) If both handle0 and handle1 are needed to be moved, set minSpan the same as
-   * maxSpan and the same as `Math.abs(handleEnd[1] - handleEnds[0])`.
-   * (2) If handle0 is forbidden to cross handle1, set minSpan as `0`.
-   *
-   * @param delta Move length.
-   * @param handleEnds handleEnds[0] can be bigger then handleEnds[1].
-   *              handleEnds will be modified in this method.
-   * @param extent handleEnds is restricted by extent.
-   *              extent[0] should less or equals than extent[1].
-   * @param handleIndex Can be 'all', means that both move the two handleEnds.
-   * @param minSpan The range of dataZoom can not be smaller than that.
-   *              If not set, handle0 and cross handle1. If set as a non-negative
-   *              number (including `0`), handles will push each other when reaching
-   *              the minSpan.
-   * @param maxSpan The range of dataZoom can not be larger than that.
-   * @return The input handleEnds.
-   */
-
-
-  function sliderMove(delta, handleEnds, extent, handleIndex, minSpan, maxSpan) {
-    delta = delta || 0;
-    var extentSpan = extent[1] - extent[0]; // Notice maxSpan and minSpan can be null/undefined.
-
-    if (minSpan != null) {
-      minSpan = restrict(minSpan, [0, extentSpan]);
-    }
-
-    if (maxSpan != null) {
-      maxSpan = Math.max(maxSpan, minSpan != null ? minSpan : 0);
-    }
-
-    if (handleIndex === 'all') {
-      var handleSpan = Math.abs(handleEnds[1] - handleEnds[0]);
-      handleSpan = restrict(handleSpan, [0, extentSpan]);
-      minSpan = maxSpan = restrict(handleSpan, [minSpan, maxSpan]);
-      handleIndex = 0;
-    }
-
-    handleEnds[0] = restrict(handleEnds[0], extent);
-    handleEnds[1] = restrict(handleEnds[1], extent);
-    var originalDistSign = getSpanSign(handleEnds, handleIndex);
-    handleEnds[handleIndex] += delta; // Restrict in extent.
-
-    var extentMinSpan = minSpan || 0;
-    var realExtent = extent.slice();
-    originalDistSign.sign < 0 ? realExtent[0] += extentMinSpan : realExtent[1] -= extentMinSpan;
-    handleEnds[handleIndex] = restrict(handleEnds[handleIndex], realExtent); // Expand span.
-
-    var currDistSign;
-    currDistSign = getSpanSign(handleEnds, handleIndex);
-
-    if (minSpan != null && (currDistSign.sign !== originalDistSign.sign || currDistSign.span < minSpan)) {
-      // If minSpan exists, 'cross' is forbidden.
-      handleEnds[1 - handleIndex] = handleEnds[handleIndex] + originalDistSign.sign * minSpan;
-    } // Shrink span.
-
-
-    currDistSign = getSpanSign(handleEnds, handleIndex);
-
-    if (maxSpan != null && currDistSign.span > maxSpan) {
-      handleEnds[1 - handleIndex] = handleEnds[handleIndex] + currDistSign.sign * maxSpan;
-    }
-
-    return handleEnds;
-  }
-
-  function getSpanSign(handleEnds, handleIndex) {
-    var dist = handleEnds[handleIndex] - handleEnds[1 - handleIndex]; // If `handleEnds[0] === handleEnds[1]`, always believe that handleEnd[0]
-    // is at left of handleEnds[1] for non-cross case.
-
-    return {
-      span: Math.abs(dist),
-      sign: dist > 0 ? -1 : dist < 0 ? 1 : handleIndex ? -1 : 1
-    };
-  }
-
-  function restrict(value, extend) {
-    return Math.min(extend[1] != null ? extend[1] : Infinity, Math.max(extend[0] != null ? extend[0] : -Infinity, value));
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
 
   var paramsSet = [['left', 'right', 'width'], ['top', 'bottom', 'height']];
   /**
@@ -53998,9 +63954,9 @@
 
 
   var linearMap$2 = linearMap;
-  var each$7 = each;
-  var mathMin$5 = Math.min;
-  var mathMax$5 = Math.max; // Arbitrary value
+  var each$8 = each;
+  var mathMin$6 = Math.min;
+  var mathMax$6 = Math.max; // Arbitrary value
 
   var HOVER_LINK_SIZE = 12;
   var HOVER_LINK_OUT = 6; // Notice:
@@ -54112,7 +64068,7 @@
       mainGroup.add(gradientBarGroup); // Bar
 
       gradientBarGroup.add(shapes.outOfRange = createPolygon());
-      gradientBarGroup.add(shapes.inRange = createPolygon(null, useHandle ? getCursor(this._orient) : null, bind(this._dragHandle, this, 'all', false), bind(this._dragHandle, this, 'all', true))); // A border radius clip.
+      gradientBarGroup.add(shapes.inRange = createPolygon(null, useHandle ? getCursor$1(this._orient) : null, bind(this._dragHandle, this, 'all', false), bind(this._dragHandle, this, 'all', true))); // A border radius clip.
 
       gradientBarGroup.setClipPath(new Rect({
         shape: {
@@ -54124,7 +64080,7 @@
         }
       }));
       var textRect = visualMapModel.textStyleModel.getTextRect('国');
-      var textSize = mathMax$5(textRect.width, textRect.height); // Handle
+      var textSize = mathMax$6(textRect.width, textRect.height); // Handle
 
       if (useHandle) {
         shapes.handleThumbs = [];
@@ -54146,7 +64102,7 @@
       var onDragEnd = bind(this._dragHandle, this, handleIndex, true);
       var handleSize = parsePercent(visualMapModel.get('handleSize'), itemSize[0]);
       var handleThumb = createSymbol(visualMapModel.get('handleIcon'), -handleSize / 2, -handleSize / 2, handleSize, handleSize, null, true);
-      var cursor = getCursor(this._orient);
+      var cursor = getCursor$1(this._orient);
       handleThumb.attr({
         cursor: cursor,
         draggable: true,
@@ -54419,7 +64375,7 @@
       var handleLabels = shapes.handleLabels;
       var itemSize = visualMapModel.itemSize;
       var dataExtent = visualMapModel.getExtent();
-      each$7([0, 1], function (handleIndex) {
+      each$8([0, 1], function (handleIndex) {
         var handleThumb = handleThumbs[handleIndex];
         handleThumb.setStyle('fill', visualInRange.handlesColor[handleIndex]);
         handleThumb.y = handleEnds[handleIndex];
@@ -54533,7 +64489,7 @@
           // below or upper than sizeExtent.
 
 
-          pos[1] = mathMin$5(mathMax$5(0, pos[1]), itemSize[1]);
+          pos[1] = mathMin$6(mathMax$6(0, pos[1]), itemSize[1]);
 
           self._doHoverLinkToSeries(pos[1], 0 <= pos[0] && pos[0] <= itemSize[0]);
         }
@@ -54567,7 +64523,7 @@
       var sizeExtent = [0, itemSize[1]];
       var dataExtent = visualMapModel.getExtent(); // For hover link show when hover handle, which might be below or upper than sizeExtent.
 
-      cursorPos = mathMin$5(mathMax$5(sizeExtent[0], cursorPos), sizeExtent[1]);
+      cursorPos = mathMin$6(mathMax$6(sizeExtent[0], cursorPos), sizeExtent[1]);
       var halfHoverLinkSize = getHalfHoverLinkSize(visualMapModel, dataExtent, sizeExtent);
       var hoverRange = [cursorPos - halfHoverLinkSize, cursorPos + halfHoverLinkSize];
       var cursorValue = linearMap$2(cursorPos, sizeExtent, dataExtent, true);
@@ -54740,7 +64696,7 @@
     return !!(hoverLinkOnHandle == null ? visualMapModel.get('realtime') : hoverLinkOnHandle);
   }
 
-  function getCursor(orient) {
+  function getCursor$1(orient) {
     return orient === 'vertical' ? 'ns-resize' : 'ew-resize';
   }
   /*
@@ -54955,7 +64911,7 @@
   // @ts-nocheck
 
 
-  var each$8 = each;
+  var each$9 = each;
 
   function visualMapPreprocessor(option) {
     var visualMap = option && option.visualMap;
@@ -54964,7 +64920,7 @@
       visualMap = visualMap ? [visualMap] : [];
     }
 
-    each$8(visualMap, function (opt) {
+    each$9(visualMap, function (opt) {
       if (!opt) {
         return;
       } // rename splitList to pieces
@@ -54978,7 +64934,7 @@
       var pieces = opt.pieces;
 
       if (pieces && isArray(pieces)) {
-        each$8(pieces, function (piece) {
+        each$9(pieces, function (piece) {
           if (isObject(piece)) {
             if (has(piece, 'start') && !has(piece, 'min')) {
               piece.min = piece.start;
@@ -55039,14 +64995,14 @@
   */
 
 
-  var installed = false;
+  var installed$1 = false;
 
-  function installCommon(registers) {
-    if (installed) {
+  function installCommon$1(registers) {
+    if (installed$1) {
       return;
     }
 
-    installed = true;
+    installed$1 = true;
     registers.registerSubTypeDefaulter('visualMap', function (option) {
       // Compatible with ec2, when splitNumber === 0, continuous visualMap will be used.
       return !option.categories && (!(option.pieces ? option.pieces.length > 0 : option.splitNumber > 0) || option.calculable) ? 'continuous' : 'piecewise';
@@ -55100,10 +65056,10 @@
   */
 
 
-  function install$8(registers) {
+  function install$14(registers) {
     registers.registerComponentModel(ContinuousModel);
     registers.registerComponentView(ContinuousView);
-    installCommon(registers);
+    installCommon$1(registers);
   }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
@@ -55881,10 +65837,10 @@
   */
 
 
-  function install$9(registers) {
+  function install$15(registers) {
     registers.registerComponentModel(PiecewiseModel);
     registers.registerComponentView(PiecewiseVisualMapView);
-    installCommon(registers);
+    installCommon$1(registers);
   }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
@@ -55929,9 +65885,9 @@
   */
 
 
-  function install$7(registers) {
-    use(install$8);
-    use(install$9); // Do not install './dataZoomSelect',
+  function install$13(registers) {
+    use(install$14);
+    use(install$15); // Do not install './dataZoomSelect',
     // since it only work for toolbox dataZoom.
   }
   /*
@@ -55977,7 +65933,7 @@
   */
 
 
-  use(install$7);
+  use(install$13);
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -56019,646 +65975,6 @@
   * specific language governing permissions and limitations
   * under the License.
   */
-
-  var DATA_ZOOM_AXIS_DIMENSIONS = ['x', 'y', 'radius', 'angle', 'single']; // Supported coords.
-  // FIXME: polar has been broken (but rarely used).
-
-  var SERIES_COORDS = ['cartesian2d', 'polar', 'singleAxis'];
-
-  function isCoordSupported(seriesModel) {
-    var coordType = seriesModel.get('coordinateSystem');
-    return indexOf(SERIES_COORDS, coordType) >= 0;
-  }
-
-  function getAxisMainType(axisDim) {
-    {
-      assert(axisDim);
-    }
-    return axisDim + 'Axis';
-  }
-  /**
-   * If two dataZoomModels has the same axis controlled, we say that they are 'linked'.
-   * This function finds all linked dataZoomModels start from the given payload.
-   */
-
-
-  function findEffectedDataZooms(ecModel, payload) {
-    // Key: `DataZoomAxisDimension`
-    var axisRecords = createHashMap();
-    var effectedModels = []; // Key: uid of dataZoomModel
-
-    var effectedModelMap = createHashMap(); // Find the dataZooms specified by payload.
-
-    ecModel.eachComponent({
-      mainType: 'dataZoom',
-      query: payload
-    }, function (dataZoomModel) {
-      if (!effectedModelMap.get(dataZoomModel.uid)) {
-        addToEffected(dataZoomModel);
-      }
-    }); // Start from the given dataZoomModels, travel the graph to find
-    // all of the linked dataZoom models.
-
-    var foundNewLink;
-
-    do {
-      foundNewLink = false;
-      ecModel.eachComponent('dataZoom', processSingle);
-    } while (foundNewLink);
-
-    function processSingle(dataZoomModel) {
-      if (!effectedModelMap.get(dataZoomModel.uid) && isLinked(dataZoomModel)) {
-        addToEffected(dataZoomModel);
-        foundNewLink = true;
-      }
-    }
-
-    function addToEffected(dataZoom) {
-      effectedModelMap.set(dataZoom.uid, true);
-      effectedModels.push(dataZoom);
-      markAxisControlled(dataZoom);
-    }
-
-    function isLinked(dataZoomModel) {
-      var isLink = false;
-      dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
-        var axisIdxArr = axisRecords.get(axisDim);
-
-        if (axisIdxArr && axisIdxArr[axisIndex]) {
-          isLink = true;
-        }
-      });
-      return isLink;
-    }
-
-    function markAxisControlled(dataZoomModel) {
-      dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
-        (axisRecords.get(axisDim) || axisRecords.set(axisDim, []))[axisIndex] = true;
-      });
-    }
-
-    return effectedModels;
-  }
-  /**
-   * Find the first target coordinate system.
-   * Available after model built.
-   *
-   * @return Like {
-   *                  grid: [
-   *                      {model: coord0, axisModels: [axis1, axis3], coordIndex: 1},
-   *                      {model: coord1, axisModels: [axis0, axis2], coordIndex: 0},
-   *                      ...
-   *                  ],  // cartesians must not be null/undefined.
-   *                  polar: [
-   *                      {model: coord0, axisModels: [axis4], coordIndex: 0},
-   *                      ...
-   *                  ],  // polars must not be null/undefined.
-   *                  singleAxis: [
-   *                      {model: coord0, axisModels: [], coordIndex: 0}
-   *                  ]
-   *              }
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  var DataZoomAxisInfo =
-  /** @class */
-  function () {
-    function DataZoomAxisInfo() {
-      this.indexList = [];
-      this.indexMap = [];
-    }
-
-    DataZoomAxisInfo.prototype.add = function (axisCmptIdx) {
-      // Remove duplication.
-      if (!this.indexMap[axisCmptIdx]) {
-        this.indexList.push(axisCmptIdx);
-        this.indexMap[axisCmptIdx] = true;
-      }
-    };
-
-    return DataZoomAxisInfo;
-  }();
-
-  var DataZoomModel =
-  /** @class */
-  function (_super) {
-    __extends(DataZoomModel, _super);
-
-    function DataZoomModel() {
-      var _this = _super !== null && _super.apply(this, arguments) || this;
-
-      _this.type = DataZoomModel.type;
-      _this._autoThrottle = true;
-      _this._noTarget = true;
-      /**
-       * It is `[rangeModeForMin, rangeModeForMax]`.
-       * The optional values for `rangeMode`:
-       * + `'value'` mode: the axis extent will always be determined by
-       *     `dataZoom.startValue` and `dataZoom.endValue`, despite
-       *     how data like and how `axis.min` and `axis.max` are.
-       * + `'percent'` mode: `100` represents 100% of the `[dMin, dMax]`,
-       *     where `dMin` is `axis.min` if `axis.min` specified, otherwise `data.extent[0]`,
-       *     and `dMax` is `axis.max` if `axis.max` specified, otherwise `data.extent[1]`.
-       *     Axis extent will be determined by the result of the percent of `[dMin, dMax]`.
-       *
-       * For example, when users are using dynamic data (update data periodically via `setOption`),
-       * if in `'value`' mode, the window will be kept in a fixed value range despite how
-       * data are appended, while if in `'percent'` mode, whe window range will be changed alone with
-       * the appended data (suppose `axis.min` and `axis.max` are not specified).
-       */
-
-      _this._rangePropMode = ['percent', 'percent'];
-      return _this;
-    }
-
-    DataZoomModel.prototype.init = function (option, parentModel, ecModel) {
-      var inputRawOption = retrieveRawOption(option);
-      /**
-       * Suppose a "main process" start at the point that model prepared (that is,
-       * model initialized or merged or method called in `action`).
-       * We should keep the `main process` idempotent, that is, given a set of values
-       * on `option`, we get the same result.
-       *
-       * But sometimes, values on `option` will be updated for providing users
-       * a "final calculated value" (`dataZoomProcessor` will do that). Those value
-       * should not be the base/input of the `main process`.
-       *
-       * So in that case we should save and keep the input of the `main process`
-       * separately, called `settledOption`.
-       *
-       * For example, consider the case:
-       * (Step_1) brush zoom the grid by `toolbox.dataZoom`,
-       *     where the original input `option.startValue`, `option.endValue` are earsed by
-       *     calculated value.
-       * (Step)2) click the legend to hide and show a series,
-       *     where the new range is calculated by the earsed `startValue` and `endValue`,
-       *     which brings incorrect result.
-       */
-
-      this.settledOption = inputRawOption;
-      this.mergeDefaultAndTheme(option, ecModel);
-
-      this._doInit(inputRawOption);
-    };
-
-    DataZoomModel.prototype.mergeOption = function (newOption) {
-      var inputRawOption = retrieveRawOption(newOption); // FIX #2591
-
-      merge(this.option, newOption, true);
-      merge(this.settledOption, inputRawOption, true);
-
-      this._doInit(inputRawOption);
-    };
-
-    DataZoomModel.prototype._doInit = function (inputRawOption) {
-      var thisOption = this.option;
-
-      this._setDefaultThrottle(inputRawOption);
-
-      this._updateRangeUse(inputRawOption);
-
-      var settledOption = this.settledOption;
-      each([['start', 'startValue'], ['end', 'endValue']], function (names, index) {
-        // start/end has higher priority over startValue/endValue if they
-        // both set, but we should make chart.setOption({endValue: 1000})
-        // effective, rather than chart.setOption({endValue: 1000, end: null}).
-        if (this._rangePropMode[index] === 'value') {
-          thisOption[names[0]] = settledOption[names[0]] = null;
-        } // Otherwise do nothing and use the merge result.
-
-      }, this);
-
-      this._resetTarget();
-    };
-
-    DataZoomModel.prototype._resetTarget = function () {
-      var optionOrient = this.get('orient', true);
-      var targetAxisIndexMap = this._targetAxisInfoMap = createHashMap();
-
-      var hasAxisSpecified = this._fillSpecifiedTargetAxis(targetAxisIndexMap);
-
-      if (hasAxisSpecified) {
-        this._orient = optionOrient || this._makeAutoOrientByTargetAxis();
-      } else {
-        this._orient = optionOrient || 'horizontal';
-
-        this._fillAutoTargetAxisByOrient(targetAxisIndexMap, this._orient);
-      }
-
-      this._noTarget = true;
-      targetAxisIndexMap.each(function (axisInfo) {
-        if (axisInfo.indexList.length) {
-          this._noTarget = false;
-        }
-      }, this);
-    };
-
-    DataZoomModel.prototype._fillSpecifiedTargetAxis = function (targetAxisIndexMap) {
-      var hasAxisSpecified = false;
-      each(DATA_ZOOM_AXIS_DIMENSIONS, function (axisDim) {
-        var refering = this.getReferringComponents(getAxisMainType(axisDim), MULTIPLE_REFERRING); // When user set axisIndex as a empty array, we think that user specify axisIndex
-        // but do not want use auto mode. Because empty array may be encountered when
-        // some error occurred.
-
-        if (!refering.specified) {
-          return;
-        }
-
-        hasAxisSpecified = true;
-        var axisInfo = new DataZoomAxisInfo();
-        each(refering.models, function (axisModel) {
-          axisInfo.add(axisModel.componentIndex);
-        });
-        targetAxisIndexMap.set(axisDim, axisInfo);
-      }, this);
-      return hasAxisSpecified;
-    };
-
-    DataZoomModel.prototype._fillAutoTargetAxisByOrient = function (targetAxisIndexMap, orient) {
-      var ecModel = this.ecModel;
-      var needAuto = true; // Find axis that parallel to dataZoom as default.
-
-      if (needAuto) {
-        var axisDim = orient === 'vertical' ? 'y' : 'x';
-        var axisModels = ecModel.findComponents({
-          mainType: axisDim + 'Axis'
-        });
-        setParallelAxis(axisModels, axisDim);
-      } // Find axis that parallel to dataZoom as default.
-
-
-      if (needAuto) {
-        var axisModels = ecModel.findComponents({
-          mainType: 'singleAxis',
-          filter: function (axisModel) {
-            return axisModel.get('orient', true) === orient;
-          }
-        });
-        setParallelAxis(axisModels, 'single');
-      }
-
-      function setParallelAxis(axisModels, axisDim) {
-        // At least use the first parallel axis as the target axis.
-        var axisModel = axisModels[0];
-
-        if (!axisModel) {
-          return;
-        }
-
-        var axisInfo = new DataZoomAxisInfo();
-        axisInfo.add(axisModel.componentIndex);
-        targetAxisIndexMap.set(axisDim, axisInfo);
-        needAuto = false; // Find parallel axes in the same grid.
-
-        if (axisDim === 'x' || axisDim === 'y') {
-          var gridModel_1 = axisModel.getReferringComponents('grid', SINGLE_REFERRING).models[0];
-          gridModel_1 && each(axisModels, function (axModel) {
-            if (axisModel.componentIndex !== axModel.componentIndex && gridModel_1 === axModel.getReferringComponents('grid', SINGLE_REFERRING).models[0]) {
-              axisInfo.add(axModel.componentIndex);
-            }
-          });
-        }
-      }
-
-      if (needAuto) {
-        // If no parallel axis, find the first category axis as default. (Also consider polar).
-        each(DATA_ZOOM_AXIS_DIMENSIONS, function (axisDim) {
-          if (!needAuto) {
-            return;
-          }
-
-          var axisModels = ecModel.findComponents({
-            mainType: getAxisMainType(axisDim),
-            filter: function (axisModel) {
-              return axisModel.get('type', true) === 'category';
-            }
-          });
-
-          if (axisModels[0]) {
-            var axisInfo = new DataZoomAxisInfo();
-            axisInfo.add(axisModels[0].componentIndex);
-            targetAxisIndexMap.set(axisDim, axisInfo);
-            needAuto = false;
-          }
-        }, this);
-      }
-    };
-
-    DataZoomModel.prototype._makeAutoOrientByTargetAxis = function () {
-      var dim; // Find the first axis
-
-      this.eachTargetAxis(function (axisDim) {
-        !dim && (dim = axisDim);
-      }, this);
-      return dim === 'y' ? 'vertical' : 'horizontal';
-    };
-
-    DataZoomModel.prototype._setDefaultThrottle = function (inputRawOption) {
-      // When first time user set throttle, auto throttle ends.
-      if (inputRawOption.hasOwnProperty('throttle')) {
-        this._autoThrottle = false;
-      }
-
-      if (this._autoThrottle) {
-        var globalOption = this.ecModel.option;
-        this.option.throttle = globalOption.animation && globalOption.animationDurationUpdate > 0 ? 100 : 20;
-      }
-    };
-
-    DataZoomModel.prototype._updateRangeUse = function (inputRawOption) {
-      var rangePropMode = this._rangePropMode;
-      var rangeModeInOption = this.get('rangeMode');
-      each([['start', 'startValue'], ['end', 'endValue']], function (names, index) {
-        var percentSpecified = inputRawOption[names[0]] != null;
-        var valueSpecified = inputRawOption[names[1]] != null;
-
-        if (percentSpecified && !valueSpecified) {
-          rangePropMode[index] = 'percent';
-        } else if (!percentSpecified && valueSpecified) {
-          rangePropMode[index] = 'value';
-        } else if (rangeModeInOption) {
-          rangePropMode[index] = rangeModeInOption[index];
-        } else if (percentSpecified) {
-          // percentSpecified && valueSpecified
-          rangePropMode[index] = 'percent';
-        } // else remain its original setting.
-
-      });
-    };
-
-    DataZoomModel.prototype.noTarget = function () {
-      return this._noTarget;
-    };
-
-    DataZoomModel.prototype.getFirstTargetAxisModel = function () {
-      var firstAxisModel;
-      this.eachTargetAxis(function (axisDim, axisIndex) {
-        if (firstAxisModel == null) {
-          firstAxisModel = this.ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
-        }
-      }, this);
-      return firstAxisModel;
-    };
-    /**
-     * @param {Function} callback param: axisModel, dimNames, axisIndex, dataZoomModel, ecModel
-     */
-
-
-    DataZoomModel.prototype.eachTargetAxis = function (callback, context) {
-      this._targetAxisInfoMap.each(function (axisInfo, axisDim) {
-        each(axisInfo.indexList, function (axisIndex) {
-          callback.call(context, axisDim, axisIndex);
-        });
-      });
-    };
-    /**
-     * @return If not found, return null/undefined.
-     */
-
-
-    DataZoomModel.prototype.getAxisProxy = function (axisDim, axisIndex) {
-      var axisModel = this.getAxisModel(axisDim, axisIndex);
-
-      if (axisModel) {
-        return axisModel.__dzAxisProxy;
-      }
-    };
-    /**
-     * @return If not found, return null/undefined.
-     */
-
-
-    DataZoomModel.prototype.getAxisModel = function (axisDim, axisIndex) {
-      {
-        assert(axisDim && axisIndex != null);
-      }
-
-      var axisInfo = this._targetAxisInfoMap.get(axisDim);
-
-      if (axisInfo && axisInfo.indexMap[axisIndex]) {
-        return this.ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
-      }
-    };
-    /**
-     * If not specified, set to undefined.
-     */
-
-
-    DataZoomModel.prototype.setRawRange = function (opt) {
-      var thisOption = this.option;
-      var settledOption = this.settledOption;
-      each([['start', 'startValue'], ['end', 'endValue']], function (names) {
-        // Consider the pair <start, startValue>:
-        // If one has value and the other one is `null/undefined`, we both set them
-        // to `settledOption`. This strategy enables the feature to clear the original
-        // value in `settledOption` to `null/undefined`.
-        // But if both of them are `null/undefined`, we do not set them to `settledOption`
-        // and keep `settledOption` with the original value. This strategy enables users to
-        // only set <end or endValue> but not set <start or startValue> when calling
-        // `dispatchAction`.
-        // The pair <end, endValue> is treated in the same way.
-        if (opt[names[0]] != null || opt[names[1]] != null) {
-          thisOption[names[0]] = settledOption[names[0]] = opt[names[0]];
-          thisOption[names[1]] = settledOption[names[1]] = opt[names[1]];
-        }
-      }, this);
-
-      this._updateRangeUse(opt);
-    };
-
-    DataZoomModel.prototype.setCalculatedRange = function (opt) {
-      var option = this.option;
-      each(['start', 'startValue', 'end', 'endValue'], function (name) {
-        option[name] = opt[name];
-      });
-    };
-
-    DataZoomModel.prototype.getPercentRange = function () {
-      var axisProxy = this.findRepresentativeAxisProxy();
-
-      if (axisProxy) {
-        return axisProxy.getDataPercentWindow();
-      }
-    };
-    /**
-     * For example, chart.getModel().getComponent('dataZoom').getValueRange('y', 0);
-     *
-     * @return [startValue, endValue] value can only be '-' or finite number.
-     */
-
-
-    DataZoomModel.prototype.getValueRange = function (axisDim, axisIndex) {
-      if (axisDim == null && axisIndex == null) {
-        var axisProxy = this.findRepresentativeAxisProxy();
-
-        if (axisProxy) {
-          return axisProxy.getDataValueWindow();
-        }
-      } else {
-        return this.getAxisProxy(axisDim, axisIndex).getDataValueWindow();
-      }
-    };
-    /**
-     * @param axisModel If axisModel given, find axisProxy
-     *      corresponding to the axisModel
-     */
-
-
-    DataZoomModel.prototype.findRepresentativeAxisProxy = function (axisModel) {
-      if (axisModel) {
-        return axisModel.__dzAxisProxy;
-      } // Find the first hosted axisProxy
-
-
-      var firstProxy;
-
-      var axisDimList = this._targetAxisInfoMap.keys();
-
-      for (var i = 0; i < axisDimList.length; i++) {
-        var axisDim = axisDimList[i];
-
-        var axisInfo = this._targetAxisInfoMap.get(axisDim);
-
-        for (var j = 0; j < axisInfo.indexList.length; j++) {
-          var proxy = this.getAxisProxy(axisDim, axisInfo.indexList[j]);
-
-          if (proxy.hostedBy(this)) {
-            return proxy;
-          }
-
-          if (!firstProxy) {
-            firstProxy = proxy;
-          }
-        }
-      } // If no hosted proxy found, still need to return a proxy.
-      // This case always happens in toolbox dataZoom, where axes are all hosted by
-      // other dataZooms.
-
-
-      return firstProxy;
-    };
-
-    DataZoomModel.prototype.getRangePropMode = function () {
-      return this._rangePropMode.slice();
-    };
-
-    DataZoomModel.prototype.getOrient = function () {
-      {
-        // Should not be called before initialized.
-        assert(this._orient);
-      }
-      return this._orient;
-    };
-
-    DataZoomModel.type = 'dataZoom';
-    DataZoomModel.dependencies = ['xAxis', 'yAxis', 'radiusAxis', 'angleAxis', 'singleAxis', 'series', 'toolbox'];
-    DataZoomModel.defaultOption = {
-      // zlevel: 0,
-      z: 4,
-      filterMode: 'filter',
-      start: 0,
-      end: 100
-    };
-    return DataZoomModel;
-  }(ComponentModel);
-  /**
-   * Retrieve those raw params from option, which will be cached separately,
-   * because they will be overwritten by normalized/calculated values in the main
-   * process.
-   */
-
-
-  function retrieveRawOption(option) {
-    var ret = {};
-    each(['start', 'end', 'startValue', 'endValue', 'throttle'], function (name) {
-      option.hasOwnProperty(name) && (ret[name] = option[name]);
-    });
-    return ret;
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
 
   var SelectDataZoomModel =
   /** @class */
@@ -56675,70 +65991,6 @@
     SelectDataZoomModel.type = 'dataZoom.select';
     return SelectDataZoomModel;
   }(DataZoomModel);
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  var DataZoomView =
-  /** @class */
-  function (_super) {
-    __extends(DataZoomView, _super);
-
-    function DataZoomView() {
-      var _this = _super !== null && _super.apply(this, arguments) || this;
-
-      _this.type = DataZoomView.type;
-      return _this;
-    }
-
-    DataZoomView.prototype.render = function (dataZoomModel, ecModel, api, payload) {
-      this.dataZoomModel = dataZoomModel;
-      this.ecModel = ecModel;
-      this.api = api;
-    };
-
-    DataZoomView.type = 'dataZoom';
-    return DataZoomView;
-  }(ComponentView);
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
   * or more contributor license agreements.  See the NOTICE file
@@ -56840,629 +66092,10 @@
   */
 
 
-  var each$9 = each;
-  var asc$2 = asc;
-  /**
-   * Operate single axis.
-   * One axis can only operated by one axis operator.
-   * Different dataZoomModels may be defined to operate the same axis.
-   * (i.e. 'inside' data zoom and 'slider' data zoom components)
-   * So dataZoomModels share one axisProxy in that case.
-   */
-
-  var AxisProxy =
-  /** @class */
-  function () {
-    function AxisProxy(dimName, axisIndex, dataZoomModel, ecModel) {
-      this._dimName = dimName;
-      this._axisIndex = axisIndex;
-      this.ecModel = ecModel;
-      this._dataZoomModel = dataZoomModel; // /**
-      //  * @readOnly
-      //  * @private
-      //  */
-      // this.hasSeriesStacked;
-    }
-    /**
-     * Whether the axisProxy is hosted by dataZoomModel.
-     */
-
-
-    AxisProxy.prototype.hostedBy = function (dataZoomModel) {
-      return this._dataZoomModel === dataZoomModel;
-    };
-    /**
-     * @return Value can only be NaN or finite value.
-     */
-
-
-    AxisProxy.prototype.getDataValueWindow = function () {
-      return this._valueWindow.slice();
-    };
-    /**
-     * @return {Array.<number>}
-     */
-
-
-    AxisProxy.prototype.getDataPercentWindow = function () {
-      return this._percentWindow.slice();
-    };
-
-    AxisProxy.prototype.getTargetSeriesModels = function () {
-      var seriesModels = [];
-      this.ecModel.eachSeries(function (seriesModel) {
-        if (isCoordSupported(seriesModel)) {
-          var axisMainType = getAxisMainType(this._dimName);
-          var axisModel = seriesModel.getReferringComponents(axisMainType, SINGLE_REFERRING).models[0];
-
-          if (axisModel && this._axisIndex === axisModel.componentIndex) {
-            seriesModels.push(seriesModel);
-          }
-        }
-      }, this);
-      return seriesModels;
-    };
-
-    AxisProxy.prototype.getAxisModel = function () {
-      return this.ecModel.getComponent(this._dimName + 'Axis', this._axisIndex);
-    };
-
-    AxisProxy.prototype.getMinMaxSpan = function () {
-      return clone(this._minMaxSpan);
-    };
-    /**
-     * Only calculate by given range and this._dataExtent, do not change anything.
-     */
-
-
-    AxisProxy.prototype.calculateDataWindow = function (opt) {
-      var dataExtent = this._dataExtent;
-      var axisModel = this.getAxisModel();
-      var scale = axisModel.axis.scale;
-
-      var rangePropMode = this._dataZoomModel.getRangePropMode();
-
-      var percentExtent = [0, 100];
-      var percentWindow = [];
-      var valueWindow = [];
-      var hasPropModeValue;
-      each$9(['start', 'end'], function (prop, idx) {
-        var boundPercent = opt[prop];
-        var boundValue = opt[prop + 'Value']; // Notice: dataZoom is based either on `percentProp` ('start', 'end') or
-        // on `valueProp` ('startValue', 'endValue'). (They are based on the data extent
-        // but not min/max of axis, which will be calculated by data window then).
-        // The former one is suitable for cases that a dataZoom component controls multiple
-        // axes with different unit or extent, and the latter one is suitable for accurate
-        // zoom by pixel (e.g., in dataZoomSelect).
-        // we use `getRangePropMode()` to mark which prop is used. `rangePropMode` is updated
-        // only when setOption or dispatchAction, otherwise it remains its original value.
-        // (Why not only record `percentProp` and always map to `valueProp`? Because
-        // the map `valueProp` -> `percentProp` -> `valueProp` probably not the original
-        // `valueProp`. consider two axes constrolled by one dataZoom. They have different
-        // data extent. All of values that are overflow the `dataExtent` will be calculated
-        // to percent '100%').
-
-        if (rangePropMode[idx] === 'percent') {
-          boundPercent == null && (boundPercent = percentExtent[idx]); // Use scale.parse to math round for category or time axis.
-
-          boundValue = scale.parse(linearMap(boundPercent, percentExtent, dataExtent));
-        } else {
-          hasPropModeValue = true;
-          boundValue = boundValue == null ? dataExtent[idx] : scale.parse(boundValue); // Calculating `percent` from `value` may be not accurate, because
-          // This calculation can not be inversed, because all of values that
-          // are overflow the `dataExtent` will be calculated to percent '100%'
-
-          boundPercent = linearMap(boundValue, dataExtent, percentExtent);
-        } // valueWindow[idx] = round(boundValue);
-        // percentWindow[idx] = round(boundPercent);
-        // fallback to extent start/end when parsed value or percent is invalid
-
-
-        valueWindow[idx] = boundValue == null || isNaN(boundValue) ? dataExtent[idx] : boundValue;
-        percentWindow[idx] = boundPercent == null || isNaN(boundPercent) ? percentExtent[idx] : boundPercent;
-      });
-      asc$2(valueWindow);
-      asc$2(percentWindow); // The windows from user calling of `dispatchAction` might be out of the extent,
-      // or do not obey the `min/maxSpan`, `min/maxValueSpan`. But we don't restrict window
-      // by `zoomLock` here, because we see `zoomLock` just as a interaction constraint,
-      // where API is able to initialize/modify the window size even though `zoomLock`
-      // specified.
-
-      var spans = this._minMaxSpan;
-      hasPropModeValue ? restrictSet(valueWindow, percentWindow, dataExtent, percentExtent, false) : restrictSet(percentWindow, valueWindow, percentExtent, dataExtent, true);
-
-      function restrictSet(fromWindow, toWindow, fromExtent, toExtent, toValue) {
-        var suffix = toValue ? 'Span' : 'ValueSpan';
-        sliderMove(0, fromWindow, fromExtent, 'all', spans['min' + suffix], spans['max' + suffix]);
-
-        for (var i = 0; i < 2; i++) {
-          toWindow[i] = linearMap(fromWindow[i], fromExtent, toExtent, true);
-          toValue && (toWindow[i] = scale.parse(toWindow[i]));
-        }
-      }
-
-      return {
-        valueWindow: valueWindow,
-        percentWindow: percentWindow
-      };
-    };
-    /**
-     * Notice: reset should not be called before series.restoreData() is called,
-     * so it is recommended to be called in "process stage" but not "model init
-     * stage".
-     */
-
-
-    AxisProxy.prototype.reset = function (dataZoomModel) {
-      if (dataZoomModel !== this._dataZoomModel) {
-        return;
-      }
-
-      var targetSeries = this.getTargetSeriesModels(); // Culculate data window and data extent, and record them.
-
-      this._dataExtent = calculateDataExtent(this, this._dimName, targetSeries); // `calculateDataWindow` uses min/maxSpan.
-
-      this._updateMinMaxSpan();
-
-      var dataWindow = this.calculateDataWindow(dataZoomModel.settledOption);
-      this._valueWindow = dataWindow.valueWindow;
-      this._percentWindow = dataWindow.percentWindow; // Update axis setting then.
-
-      this._setAxisModel();
-    };
-
-    AxisProxy.prototype.filterData = function (dataZoomModel, api) {
-      if (dataZoomModel !== this._dataZoomModel) {
-        return;
-      }
-
-      var axisDim = this._dimName;
-      var seriesModels = this.getTargetSeriesModels();
-      var filterMode = dataZoomModel.get('filterMode');
-      var valueWindow = this._valueWindow;
-
-      if (filterMode === 'none') {
-        return;
-      } // FIXME
-      // Toolbox may has dataZoom injected. And if there are stacked bar chart
-      // with NaN data, NaN will be filtered and stack will be wrong.
-      // So we need to force the mode to be set empty.
-      // In fect, it is not a big deal that do not support filterMode-'filter'
-      // when using toolbox#dataZoom, utill tooltip#dataZoom support "single axis
-      // selection" some day, which might need "adapt to data extent on the
-      // otherAxis", which is disabled by filterMode-'empty'.
-      // But currently, stack has been fixed to based on value but not index,
-      // so this is not an issue any more.
-      // let otherAxisModel = this.getOtherAxisModel();
-      // if (dataZoomModel.get('$fromToolbox')
-      //     && otherAxisModel
-      //     && otherAxisModel.hasSeriesStacked
-      // ) {
-      //     filterMode = 'empty';
-      // }
-      // TODO
-      // filterMode 'weakFilter' and 'empty' is not optimized for huge data yet.
-
-
-      each$9(seriesModels, function (seriesModel) {
-        var seriesData = seriesModel.getData();
-        var dataDims = seriesData.mapDimensionsAll(axisDim);
-
-        if (!dataDims.length) {
-          return;
-        }
-
-        if (filterMode === 'weakFilter') {
-          var store_1 = seriesData.getStore();
-          var dataDimIndices_1 = map(dataDims, function (dim) {
-            return seriesData.getDimensionIndex(dim);
-          }, seriesData);
-          seriesData.filterSelf(function (dataIndex) {
-            var leftOut;
-            var rightOut;
-            var hasValue;
-
-            for (var i = 0; i < dataDims.length; i++) {
-              var value = store_1.get(dataDimIndices_1[i], dataIndex);
-              var thisHasValue = !isNaN(value);
-              var thisLeftOut = value < valueWindow[0];
-              var thisRightOut = value > valueWindow[1];
-
-              if (thisHasValue && !thisLeftOut && !thisRightOut) {
-                return true;
-              }
-
-              thisHasValue && (hasValue = true);
-              thisLeftOut && (leftOut = true);
-              thisRightOut && (rightOut = true);
-            } // If both left out and right out, do not filter.
-
-
-            return hasValue && leftOut && rightOut;
-          });
-        } else {
-          each$9(dataDims, function (dim) {
-            if (filterMode === 'empty') {
-              seriesModel.setData(seriesData = seriesData.map(dim, function (value) {
-                return !isInWindow(value) ? NaN : value;
-              }));
-            } else {
-              var range = {};
-              range[dim] = valueWindow; // console.time('select');
-
-              seriesData.selectRange(range); // console.timeEnd('select');
-            }
-          });
-        }
-
-        each$9(dataDims, function (dim) {
-          seriesData.setApproximateExtent(valueWindow, dim);
-        });
-      });
-
-      function isInWindow(value) {
-        return value >= valueWindow[0] && value <= valueWindow[1];
-      }
-    };
-
-    AxisProxy.prototype._updateMinMaxSpan = function () {
-      var minMaxSpan = this._minMaxSpan = {};
-      var dataZoomModel = this._dataZoomModel;
-      var dataExtent = this._dataExtent;
-      each$9(['min', 'max'], function (minMax) {
-        var percentSpan = dataZoomModel.get(minMax + 'Span');
-        var valueSpan = dataZoomModel.get(minMax + 'ValueSpan');
-        valueSpan != null && (valueSpan = this.getAxisModel().axis.scale.parse(valueSpan)); // minValueSpan and maxValueSpan has higher priority than minSpan and maxSpan
-
-        if (valueSpan != null) {
-          percentSpan = linearMap(dataExtent[0] + valueSpan, dataExtent, [0, 100], true);
-        } else if (percentSpan != null) {
-          valueSpan = linearMap(percentSpan, [0, 100], dataExtent, true) - dataExtent[0];
-        }
-
-        minMaxSpan[minMax + 'Span'] = percentSpan;
-        minMaxSpan[minMax + 'ValueSpan'] = valueSpan;
-      }, this);
-    };
-
-    AxisProxy.prototype._setAxisModel = function () {
-      var axisModel = this.getAxisModel();
-      var percentWindow = this._percentWindow;
-      var valueWindow = this._valueWindow;
-
-      if (!percentWindow) {
-        return;
-      } // [0, 500]: arbitrary value, guess axis extent.
-
-
-      var precision = getPixelPrecision(valueWindow, [0, 500]);
-      precision = Math.min(precision, 20); // For value axis, if min/max/scale are not set, we just use the extent obtained
-      // by series data, which may be a little different from the extent calculated by
-      // `axisHelper.getScaleExtent`. But the different just affects the experience a
-      // little when zooming. So it will not be fixed until some users require it strongly.
-
-      var rawExtentInfo = axisModel.axis.scale.rawExtentInfo;
-
-      if (percentWindow[0] !== 0) {
-        rawExtentInfo.setDeterminedMinMax('min', +valueWindow[0].toFixed(precision));
-      }
-
-      if (percentWindow[1] !== 100) {
-        rawExtentInfo.setDeterminedMinMax('max', +valueWindow[1].toFixed(precision));
-      }
-
-      rawExtentInfo.freeze();
-    };
-
-    return AxisProxy;
-  }();
-
-  function calculateDataExtent(axisProxy, axisDim, seriesModels) {
-    var dataExtent = [Infinity, -Infinity];
-    each$9(seriesModels, function (seriesModel) {
-      unionAxisExtentFromData(dataExtent, seriesModel.getData(), axisDim);
-    }); // It is important to get "consistent" extent when more then one axes is
-    // controlled by a `dataZoom`, otherwise those axes will not be synchronized
-    // when zooming. But it is difficult to know what is "consistent", considering
-    // axes have different type or even different meanings (For example, two
-    // time axes are used to compare data of the same date in different years).
-    // So basically dataZoom just obtains extent by series.data (in category axis
-    // extent can be obtained from axis.data).
-    // Nevertheless, user can set min/max/scale on axes to make extent of axes
-    // consistent.
-
-    var axisModel = axisProxy.getAxisModel();
-    var rawExtentResult = ensureScaleRawExtentInfo(axisModel.axis.scale, axisModel, dataExtent).calculate();
-    return [rawExtentResult.min, rawExtentResult.max];
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  var dataZoomProcessor = {
-    // `dataZoomProcessor` will only be performed in needed series. Consider if
-    // there is a line series and a pie series, it is better not to update the
-    // line series if only pie series is needed to be updated.
-    getTargetSeries: function (ecModel) {
-      function eachAxisModel(cb) {
-        ecModel.eachComponent('dataZoom', function (dataZoomModel) {
-          dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
-            var axisModel = ecModel.getComponent(getAxisMainType(axisDim), axisIndex);
-            cb(axisDim, axisIndex, axisModel, dataZoomModel);
-          });
-        });
-      } // FIXME: it brings side-effect to `getTargetSeries`.
-      // Prepare axis proxies.
-
-
-      eachAxisModel(function (axisDim, axisIndex, axisModel, dataZoomModel) {
-        // dispose all last axis proxy, in case that some axis are deleted.
-        axisModel.__dzAxisProxy = null;
-      });
-      var proxyList = [];
-      eachAxisModel(function (axisDim, axisIndex, axisModel, dataZoomModel) {
-        // Different dataZooms may constrol the same axis. In that case,
-        // an axisProxy serves both of them.
-        if (!axisModel.__dzAxisProxy) {
-          // Use the first dataZoomModel as the main model of axisProxy.
-          axisModel.__dzAxisProxy = new AxisProxy(axisDim, axisIndex, dataZoomModel, ecModel);
-          proxyList.push(axisModel.__dzAxisProxy);
-        }
-      });
-      var seriesModelMap = createHashMap();
-      each(proxyList, function (axisProxy) {
-        each(axisProxy.getTargetSeriesModels(), function (seriesModel) {
-          seriesModelMap.set(seriesModel.uid, seriesModel);
-        });
-      });
-      return seriesModelMap;
-    },
-    // Consider appendData, where filter should be performed. Because data process is
-    // in block mode currently, it is not need to worry about that the overallProgress
-    // execute every frame.
-    overallReset: function (ecModel, api) {
-      ecModel.eachComponent('dataZoom', function (dataZoomModel) {
-        // We calculate window and reset axis here but not in model
-        // init stage and not after action dispatch handler, because
-        // reset should be called after seriesData.restoreData.
-        dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
-          dataZoomModel.getAxisProxy(axisDim, axisIndex).reset(dataZoomModel);
-        }); // Caution: data zoom filtering is order sensitive when using
-        // percent range and no min/max/scale set on axis.
-        // For example, we have dataZoom definition:
-        // [
-        //      {xAxisIndex: 0, start: 30, end: 70},
-        //      {yAxisIndex: 0, start: 20, end: 80}
-        // ]
-        // In this case, [20, 80] of y-dataZoom should be based on data
-        // that have filtered by x-dataZoom using range of [30, 70],
-        // but should not be based on full raw data. Thus sliding
-        // x-dataZoom will change both ranges of xAxis and yAxis,
-        // while sliding y-dataZoom will only change the range of yAxis.
-        // So we should filter x-axis after reset x-axis immediately,
-        // and then reset y-axis and filter y-axis.
-
-        dataZoomModel.eachTargetAxis(function (axisDim, axisIndex) {
-          dataZoomModel.getAxisProxy(axisDim, axisIndex).filterData(dataZoomModel, api);
-        });
-      });
-      ecModel.eachComponent('dataZoom', function (dataZoomModel) {
-        // Fullfill all of the range props so that user
-        // is able to get them from chart.getOption().
-        var axisProxy = dataZoomModel.findRepresentativeAxisProxy();
-
-        if (axisProxy) {
-          var percentRange = axisProxy.getDataPercentWindow();
-          var valueRange = axisProxy.getDataValueWindow();
-          dataZoomModel.setCalculatedRange({
-            start: percentRange[0],
-            end: percentRange[1],
-            startValue: valueRange[0],
-            endValue: valueRange[1]
-          });
-        }
-      });
-    }
-  };
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  function installDataZoomAction(registers) {
-    registers.registerAction('dataZoom', function (payload, ecModel) {
-      var effectedModels = findEffectedDataZooms(ecModel, payload);
-      each(effectedModels, function (dataZoomModel) {
-        dataZoomModel.setRawRange({
-          start: payload.start,
-          end: payload.end,
-          startValue: payload.startValue,
-          endValue: payload.endValue
-        });
-      });
-    });
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  var installed$1 = false;
-
-  function installCommon$1(registers) {
-    if (installed$1) {
-      return;
-    }
-
-    installed$1 = true;
-    registers.registerProcessor(registers.PRIORITY.PROCESSOR.FILTER, dataZoomProcessor);
-    installDataZoomAction(registers);
-    registers.registerSubTypeDefaulter('dataZoom', function () {
-      // Default 'slider' when no type specified.
-      return 'slider';
-    });
-  }
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-
-  function install$11(registers) {
+  function install$17(registers) {
     registers.registerComponentModel(SelectDataZoomModel);
     registers.registerComponentView(SelectDataZoomView);
-    installCommon$1(registers);
+    installCommon(registers);
   }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
@@ -58933,7 +67566,7 @@
   */
 
   var each$10 = each;
-  var inner$9 = makeInner();
+  var inner$13 = makeInner();
   /**
    * @param ecModel
    * @param newSnapshot key is dataZoomId
@@ -58995,7 +67628,7 @@
   }
 
   function clear$1(ecModel) {
-    inner$9(ecModel).snapshots = null;
+    inner$13(ecModel).snapshots = null;
   }
 
   function count(ecModel) {
@@ -59008,7 +67641,7 @@
 
 
   function getStoreSnapshots(ecModel) {
-    var store = inner$9(ecModel);
+    var store = inner$13(ecModel);
 
     if (!store.snapshots) {
       store.snapshots = [{}];
@@ -59138,87 +67771,10 @@
   * specific language governing permissions and limitations
   * under the License.
   */
-  // @ts-nocheck
-
-  var ATTR = '\0_ec_interaction_mutex';
-
-  function take(zr, resourceKey, userKey) {
-    var store = getStore(zr);
-    store[resourceKey] = userKey;
-  }
-
-  function release(zr, resourceKey, userKey) {
-    var store = getStore(zr);
-    var uKey = store[resourceKey];
-
-    if (uKey === userKey) {
-      store[resourceKey] = null;
-    }
-  }
-
-  function getStore(zr) {
-    return zr[ATTR] || (zr[ATTR] = {});
-  }
-  /**
-   * payload: {
-   *     type: 'takeGlobalCursor',
-   *     key: 'dataZoomSelect', or 'brush', or ...,
-   *         If no userKey, release global cursor.
-   * }
-   */
-  // TODO: SELF REGISTERED.
-
-
-  registerAction({
-    type: 'takeGlobalCursor',
-    event: 'globalCursorTaken',
-    update: 'update'
-  }, noop);
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
-
-  /**
-   * AUTO-GENERATED FILE. DO NOT MODIFY.
-   */
-
-  /*
-  * Licensed to the Apache Software Foundation (ASF) under one
-  * or more contributor license agreements.  See the NOTICE file
-  * distributed with this work for additional information
-  * regarding copyright ownership.  The ASF licenses this file
-  * to you under the Apache License, Version 2.0 (the
-  * "License"); you may not use this file except in compliance
-  * with the License.  You may obtain a copy of the License at
-  *
-  *   http://www.apache.org/licenses/LICENSE-2.0
-  *
-  * Unless required by applicable law or agreed to in writing,
-  * software distributed under the License is distributed on an
-  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  * KIND, either express or implied.  See the License for the
-  * specific language governing permissions and limitations
-  * under the License.
-  */
 
   var BRUSH_PANEL_GLOBAL = true;
-  var mathMin$6 = Math.min;
-  var mathMax$6 = Math.max;
+  var mathMin$7 = Math.min;
+  var mathMax$7 = Math.max;
   var mathPow$2 = Math.pow;
   var COVER_Z = 10000;
   var UNSELECT_THRESHOLD = 6;
@@ -59525,7 +68081,7 @@
     return !!originalLength;
   }
 
-  function trigger(controller, opt) {
+  function trigger$1(controller, opt) {
     var areas = map(controller._covers, function (cover) {
       var brushOption = cover.__brushOption;
       var range = clone(brushOption.range);
@@ -59572,7 +68128,7 @@
       draggable: true,
       cursor: 'move',
       drift: curry(driftRect, rectRangeConverter, controller, cover, ['n', 's', 'w', 'e']),
-      ondragend: curry(trigger, controller, {
+      ondragend: curry(trigger$1, controller, {
         isEnd: true
       })
     }));
@@ -59586,7 +68142,7 @@
         silent: true,
         invisible: true,
         drift: curry(driftRect, rectRangeConverter, controller, cover, nameSequence),
-        ondragend: curry(trigger, controller, {
+        ondragend: curry(trigger$1, controller, {
           isEnd: true
         })
       }));
@@ -59596,7 +68152,7 @@
 
   function updateBaseRect(controller, cover, localRange, brushOption) {
     var lineWidth = brushOption.brushStyle.lineWidth || 0;
-    var handleSize = mathMax$6(lineWidth, MIN_RESIZE_LINE_WIDTH);
+    var handleSize = mathMax$7(lineWidth, MIN_RESIZE_LINE_WIDTH);
     var x = localRange[0][0];
     var y = localRange[1][0];
     var xa = x - lineWidth / 2;
@@ -59655,8 +68211,8 @@
   }
 
   function formatRectRange(x, y, x2, y2) {
-    var min = [mathMin$6(x, x2), mathMin$6(y, y2)];
-    var max = [mathMax$6(x, x2), mathMax$6(y, y2)];
+    var min = [mathMin$7(x, x2), mathMin$7(y, y2)];
+    var max = [mathMax$7(x, x2), mathMax$7(y, y2)];
     return [[min[0], max[0]], [min[1], max[1]] // y range
     ];
   }
@@ -59698,7 +68254,7 @@
     });
     brushOption.range = rectRangeConverter.fromRectRange(formatRectRange(rectRange[0][0], rectRange[1][0], rectRange[0][1], rectRange[1][1]));
     updateCoverAfterCreation(controller, cover);
-    trigger(controller, {
+    trigger$1(controller, {
       isEnd: false
     });
   }
@@ -59711,7 +68267,7 @@
       point[1] += localDelta[1];
     });
     updateCoverAfterCreation(controller, cover);
-    trigger(controller, {
+    trigger$1(controller, {
       isEnd: false
     });
   }
@@ -59729,10 +68285,10 @@
   }
 
   function pointsToRect(points) {
-    var xmin = mathMin$6(points[0][0], points[1][0]);
-    var ymin = mathMin$6(points[0][1], points[1][1]);
-    var xmax = mathMax$6(points[0][0], points[1][0]);
-    var ymax = mathMax$6(points[0][1], points[1][1]);
+    var xmin = mathMin$7(points[0][0], points[1][0]);
+    var ymin = mathMin$7(points[0][1], points[1][1]);
+    var xmax = mathMax$7(points[0][0], points[1][0]);
+    var ymax = mathMax$7(points[0][1], points[1][1]);
     return {
       x: xmin,
       y: ymin,
@@ -59866,7 +68422,7 @@
       if (this._dragging) {
         preventDefault(e);
         var eventParams = updateCoverByMouse(this, e, localCursorPoint, false);
-        eventParams && trigger(this, eventParams);
+        eventParams && trigger$1(this, eventParams);
       }
     },
     mouseup: function (e) {
@@ -59885,7 +68441,7 @@
       controller._track = [];
       controller._creatingCover = null; // trigger event shoule be at final, after procedure will be nested.
 
-      eventParams && trigger(controller, eventParams);
+      eventParams && trigger$1(controller, eventParams);
     }
   }
 
@@ -59944,7 +68500,7 @@
           name: 'main',
           draggable: true,
           drift: curry(driftPolygon, controller, cover),
-          ondragend: curry(trigger, controller, {
+          ondragend: curry(trigger$1, controller, {
             isEnd: true
           })
         }));
@@ -59975,8 +68531,8 @@
       },
       getCreatingRange: function (localTrack) {
         var ends = getTrackEnds(localTrack);
-        var min = mathMin$6(ends[0][xyIndex], ends[1][xyIndex]);
-        var max = mathMax$6(ends[0][xyIndex], ends[1][xyIndex]);
+        var min = mathMin$7(ends[0][xyIndex], ends[1][xyIndex]);
+        var max = mathMax$7(ends[0][xyIndex], ends[1][xyIndex]);
         return [min, max];
       },
       updateCoverShape: function (controller, cover, localRange, brushOption) {
@@ -60811,7 +69367,7 @@
   * under the License.
   */
 
-  function install$10(registers) {
+  function install$16(registers) {
     registers.registerComponentModel(ToolboxModel);
     registers.registerComponentView(ToolboxView);
     registerFeature('saveAsImage', SaveAsImage);
@@ -60819,7 +69375,7 @@
     registerFeature('dataView', DataView);
     registerFeature('dataZoom', DataZoomFeature);
     registerFeature('restore', RestoreOption);
-    use(install$11);
+    use(install$17);
   }
   /*
   * Licensed to the Apache Software Foundation (ASF) under one
@@ -60864,7 +69420,7 @@
   */
 
 
-  use(install$10);
+  use(install$16);
   exports.version = version;
   exports.dependencies = dependencies;
   exports.PRIORITY = PRIORITY;

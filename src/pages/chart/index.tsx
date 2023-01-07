@@ -4,6 +4,7 @@ import { View } from '@tarojs/components';
 import { useShareAppMessage, useShareTimeline } from '@tarojs/taro';
 import { useWindowSize } from '../utils';
 import Chart from './chart';
+import History from './history';
 
 import './index.scss';
 
@@ -76,6 +77,7 @@ export default function Index() {
     <View ref={ref} className='page'>
       {/*FIXME: 默认值为1传入然后动态产生变化，会导致图表高宽错乱。目前先workaround等值动态取到后再实例化子组建。*/}
       {styleZoom ? <Chart styleZoom={styleZoom} styleRatio={styleRatio}></Chart> : ''}
+      {styleZoom ? <History styleZoom={styleZoom} styleRatio={styleRatio}></History> : ''}
     </View>
   );
 }
