@@ -10,7 +10,10 @@ interface Props {
   styleRatio: number;
 }
 
-const getOption: EChartOption = (styleZoom, styleRatio, t) => {
+const getOption: EChartOption = (data, styleZoom, styleRatio, t) => {
+  if (!data) {
+    return null;
+  }
   const option = {
     title: {
       top: 10 * styleZoom * styleRatio,
@@ -24,19 +27,25 @@ const getOption: EChartOption = (styleZoom, styleRatio, t) => {
       trigger: 'axis',
     },
     grid: {
-      left: '8%',
+      left: '7%',
       right: '3%',
       bottom: '16%',
     },
     xAxis: {
-      // FIXME: this fontSize doesn't work
-      nameTextStyle: {
-        fontSize: 12 * styleZoom,
+      data: data.map(function (item) {
+        return item[0];
+      }),
+      axisLabel: {
+        textStyle: {
+          fontSize: 12 * styleZoom,
+        },
       },
     },
     yAxis: {
-      nameTextStyle: {
-        fontSize: 12 * styleZoom,
+      axisLabel: {
+        textStyle: {
+          fontSize: 12 * styleZoom,
+        },
       },
     },
     toolbox: {
@@ -51,6 +60,8 @@ const getOption: EChartOption = (styleZoom, styleRatio, t) => {
     dataZoom: [
       {
         startValue: '2020-03-09',
+        height: 30 * styleZoom * styleRatio,
+        bottom: 25 * styleZoom * styleRatio,
       },
       {
         type: 'inside',
@@ -70,11 +81,18 @@ const getOption: EChartOption = (styleZoom, styleRatio, t) => {
     series: {
       name: t['chart.unit'],
       type: 'line',
+      data: data.map(function (item) {
+        return item[1];
+      }),
       markPoint: {
         data: [
           { type: 'max', name: 'Max' },
           { type: 'min', name: 'Min' },
         ],
+        label: {
+          fontSize: 12 * styleZoom,
+        },
+        symbolSize: 50 * styleZoom,
       },
     },
   };
@@ -93,11 +111,7 @@ export const History = (props: Props) => {
   const [isReady, setIsReady] = useState(false);
   const { dailyTotal } = useAppSelector((state) => state.dailyTotal);
   const dispatch = useAppDispatch();
-  const option = useMemo(() => getOption(styleZoom, styleRatio, t), [styleZoom, styleRatio]);
-
-  // console.log(`styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
-  // console.log(`width: ${750 * styleZoom}, height: ${562 * styleZoom * styleRatio}`);
-  // console.log(option);
+  const option = useMemo(() => getOption(dailyTotal, styleZoom, styleRatio, t), [dailyTotal, styleZoom, styleRatio, t]);
 
   useEffect(() => {
     const promise = dispatch(getDailyTotal());
@@ -108,15 +122,9 @@ export const History = (props: Props) => {
 
   useEffect(() => {
     if (isReady && dailyTotal) {
-      option.xAxis.data = dailyTotal.map(function (item) {
-        return item[0];
-      });
-      option.series.data = dailyTotal.map(function (item) {
-        return item[1];
-      });
       ref.current.setOption(option);
     }
-  }, [isReady, dailyTotal, styleZoom, styleRatio]);
+  }, [isReady, dailyTotal, styleZoom, styleRatio, option]);
 
   useEffect(() => {
     // console.log(`### Changed: styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
