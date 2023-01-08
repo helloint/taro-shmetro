@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { View } from '@tarojs/components';
 import Echarts, { EChartOption, EChartsInstance } from 'taro-react-echarts';
 import echarts from '../../assets/js/echarts';
 import { getDailyTotal } from '../../store/dailyTotal/dailyTotalSlice';
@@ -149,7 +150,7 @@ export const History = (props: Props) => {
       }}
     ></Echarts>
   ) : (
-    <div>Loading</div>
+    <View>Loading</View>
   );
 };
 
