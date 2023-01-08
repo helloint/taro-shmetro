@@ -3,10 +3,10 @@ import { useTranslation } from 'react-i18next';
 import { View } from '@tarojs/components';
 import Echarts, { EChartOption, EChartsInstance } from 'taro-react-echarts';
 import echarts from '../../assets/js/echarts';
-import { getDailyTotal } from '../../store/dailyTotal/dailyTotalSlice';
-import { useAppDispatch, useAppSelector } from '../../store/hooks';
+import { MetroDaily } from '../utils';
 
 interface Props {
+  data: MetroDaily;
   styleZoom: number;
   styleRatio: number;
 }
@@ -107,19 +107,10 @@ const getOption: EChartOption = (data, styleZoom, styleRatio, t) => {
 
 export const History = (props: Props) => {
   const { t } = useTranslation();
-  const { styleZoom, styleRatio } = props;
+  const { data: dailyTotal, styleZoom, styleRatio } = props;
   const ref = useRef<EChartsInstance>(null);
   const [isReady, setIsReady] = useState(false);
-  const { dailyTotal } = useAppSelector((state) => state.dailyTotal);
-  const dispatch = useAppDispatch();
   const option = useMemo(() => getOption(dailyTotal, styleZoom, styleRatio, t), [dailyTotal, styleZoom, styleRatio, t]);
-
-  useEffect(() => {
-    const promise = dispatch(getDailyTotal());
-    return () => {
-      promise.abort();
-    };
-  }, [dispatch]);
 
   useEffect(() => {
     if (isReady && dailyTotal) {
@@ -127,11 +118,7 @@ export const History = (props: Props) => {
     }
   }, [isReady, dailyTotal, styleZoom, styleRatio, option]);
 
-  useEffect(() => {
-    // console.log(`### Changed: styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
-  }, [styleZoom, styleRatio]);
-
-  return dailyTotal ? (
+  return (
     <Echarts
       isPage={false}
       key='history'
@@ -149,8 +136,6 @@ export const History = (props: Props) => {
         height: 562 * styleZoom * styleRatio + 'px',
       }}
     ></Echarts>
-  ) : (
-    <View>Loading</View>
   );
 };
 

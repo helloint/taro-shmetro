@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { View } from '@tarojs/components';
 import { useShareAppMessage, useShareTimeline } from '@tarojs/taro';
+import { getDailyTotal } from '../../store/dailyTotal/dailyTotalSlice';
+import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { useWindowSize } from '../utils';
 import Chart from './chart';
 import History from './history';
@@ -22,6 +24,15 @@ export default function Index() {
   const styleRatio = 1;
   const [containerReady, setContainerReady] = useState(false);
   const containerResize = useWindowSize();
+  const { dailyTotal } = useAppSelector((state) => state.dailyTotal);
+  const dispatch = useAppDispatch();
+
+  useEffect(() => {
+    const promise = dispatch(getDailyTotal());
+    return () => {
+      promise.abort();
+    };
+  }, [dispatch]);
 
   useEffect(() => {
     setContainerReady(true);
@@ -75,10 +86,16 @@ export default function Index() {
 
   return (
     <View ref={ref} className='page'>
-      {/*FIXME: 默认值为1传入然后动态产生变化，会导致图表高宽错乱。目前先workaround等值动态取到后再实例化子组建。*/}
-      {styleZoom ? <Chart styleZoom={styleZoom} styleRatio={styleRatio}></Chart> : ''}
-      {styleZoom ? <History styleZoom={styleZoom} styleRatio={styleRatio}></History> : ''}
-      {styleZoom ? <View style={{ fontSize: '12px', color: '#b9b8cc', padding: '5px 0' }}>helloint</View> : ''}
+      {styleZoom && dailyTotal ? (
+        <View>
+          {/*FIXME: 默认值为1传入然后动态产生变化，会导致图表高宽错乱。目前先workaround等值动态取到后再实例化子组建。*/}
+          <Chart data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></Chart>
+          <History data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></History>
+        </View>
+      ) : (
+        <View>Loading</View>
+      )}
+      <View style={{ fontSize: '12px', color: '#b9b8cc', padding: '5px 0' }}>by helloint</View>
     </View>
   );
 }

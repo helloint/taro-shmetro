@@ -3,16 +3,24 @@ import { useTranslation } from 'react-i18next';
 import { View } from '@tarojs/components';
 import Echarts, { EChartOption, EChartsInstance } from 'taro-react-echarts';
 import echarts from '../../assets/js/echarts';
-import { getDailyTotal } from '../../store/dailyTotal/dailyTotalSlice';
-import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { MetroDaily } from '../utils';
 
 interface Props {
+  data: MetroDaily;
   styleZoom: number;
   styleRatio: number;
 }
 
-const getOption: EChartOption = (styleZoom, styleRatio, t) => {
+const getOption: EChartOption = (dailyTotal, styleZoom, styleRatio, t) => {
+  const displayData: MetroDaily[] = [];
+  const dayOfWeek = new Date(dailyTotal[dailyTotal.length - 1][0]).getDay();
+  const totalDisplayDay = 28 + (dayOfWeek ? dayOfWeek : 7);
+  dailyTotal.forEach(([date, num]) => {
+    displayData.push([date, num]);
+    if (displayData.length > totalDisplayDay) {
+      displayData.shift();
+    }
+  });
   const option = {
     title: {
       top: 10 * styleZoom * styleRatio,
@@ -57,7 +65,7 @@ const getOption: EChartOption = (styleZoom, styleRatio, t) => {
         },
       },
       orient: 'vertical',
-      range: [0, 1500],
+      range: [displayData[0][0], displayData[displayData.length - 1][0]],
       itemStyle: {
         borderWidth: 0.5,
       },
@@ -86,7 +94,7 @@ const getOption: EChartOption = (styleZoom, styleRatio, t) => {
         fontSize: 16 * styleZoom,
         color: '#fff',
       },
-      data: [],
+      data: displayData,
     },
     toolbox: {},
   };
@@ -104,46 +112,22 @@ const getOption: EChartOption = (styleZoom, styleRatio, t) => {
 
 export const Chart = (props: Props) => {
   const { t } = useTranslation();
-  const { styleZoom, styleRatio } = props;
+  const { data: dailyTotal, styleZoom, styleRatio } = props;
   const ref = useRef<EChartsInstance>(null);
   const [isReady, setIsReady] = useState(false);
-  const { dailyTotal } = useAppSelector((state) => state.dailyTotal);
-  const dispatch = useAppDispatch();
-  const option = useMemo(() => getOption(styleZoom, styleRatio, t), [styleZoom, styleRatio]);
+  const option = useMemo(() => getOption(dailyTotal, styleZoom, styleRatio, t), [dailyTotal, styleZoom, styleRatio, t]);
 
   // console.log(`styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
   // console.log(`width: ${750 * styleZoom}, height: ${562 * styleZoom * styleRatio}`);
   // console.log(option);
 
   useEffect(() => {
-    const promise = dispatch(getDailyTotal());
-    return () => {
-      promise.abort();
-    };
-  }, [dispatch]);
-
-  useEffect(() => {
     if (isReady && dailyTotal) {
-      const displayData: MetroDaily[] = [];
-      const dayOfWeek = new Date(dailyTotal[dailyTotal.length - 1][0]).getDay();
-      const totalDisplayDay = 28 + (dayOfWeek ? dayOfWeek : 7);
-      dailyTotal.forEach(([date, num]) => {
-        displayData.push([date, num]);
-        if (displayData.length > totalDisplayDay) {
-          displayData.shift();
-        }
-      });
-      option.calendar.range = [displayData[0][0], displayData[displayData.length - 1][0]];
-      option.series.data = displayData;
       ref.current.setOption(option);
     }
-  }, [isReady, dailyTotal, styleZoom, styleRatio]);
+  }, [isReady, dailyTotal, styleZoom, styleRatio, option]);
 
-  useEffect(() => {
-    // console.log(`### Changed: styleZoom: ${styleZoom}, styleRatio: ${styleRatio}`);
-  }, [styleZoom, styleRatio]);
-
-  return dailyTotal ? (
+  return (
     <Echarts
       isPage={false}
       key='metro'
@@ -161,8 +145,6 @@ export const Chart = (props: Props) => {
         height: 562 * styleZoom * styleRatio + 'px',
       }}
     ></Echarts>
-  ) : (
-    <View>Loading</View>
   );
 };
 
