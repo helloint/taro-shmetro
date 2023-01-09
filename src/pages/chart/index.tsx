@@ -93,9 +93,9 @@ export default function Index() {
           <History data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></History>
         </View>
       ) : (
-        <View>Loading</View>
+        <View className='loading'>{t('common.loading')}</View>
       )}
-      <View style={{ fontSize: '12px', color: '#b9b8cc', padding: '5px 0' }}>by helloint</View>
+      <View className='sign'>{t('common.sign')}</View>
     </View>
   );
 }

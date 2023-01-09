@@ -15,6 +15,7 @@
   "common": {
     "loading": "加载中...",
     "date_pattern": "yyyy年mm月dd日",
-    "short_date_pattern": "mm月dd日"
+    "short_date_pattern": "mm月dd日",
+    "sign": "by helloint"
   }
 }

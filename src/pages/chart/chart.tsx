@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { View } from '@tarojs/components';
 import Echarts, { EChartOption, EChartsInstance } from 'taro-react-echarts';
 import echarts from '../../assets/js/echarts';
 import { MetroDaily } from '../utils';
