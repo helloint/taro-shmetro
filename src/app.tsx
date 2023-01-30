@@ -19,7 +19,7 @@ const App = (props) => {
     httpClient(CONFIG_URL).then((data: Config) => {
       i18n.changeLanguage(data.locale);
     });
-  }, []);
+  }, [i18n]);
 
   return (
     <Provider store={store}>

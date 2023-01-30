@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { View } from '@tarojs/components';
 import Echarts, { EChartOption, EChartsInstance } from 'taro-react-echarts';
 import echarts from '../../assets/js/echarts';
 import { MetroDaily } from '../utils';
@@ -52,15 +51,12 @@ const getOption: EChartOption = (data, styleZoom, styleRatio, t) => {
     toolbox: {
       right: 10,
       feature: {
-        dataZoom: {
-          yAxisIndex: 'none',
-        },
         restore: {},
       },
     },
     dataZoom: [
       {
-        startValue: '2020-03-09',
+        startValue: data[data.length - 30][0],
         height: 30 * styleZoom * styleRatio,
         bottom: 25 * styleZoom * styleRatio,
       },
