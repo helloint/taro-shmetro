@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { View } from '@tarojs/components';
+import { Image, Text, View } from '@tarojs/components';
 import { useShareAppMessage, useShareTimeline } from '@tarojs/taro';
+import githubImg from '../../images/github.svg';
 import { getDailyTotal } from '../../store/dailyTotal/dailyTotalSlice';
 import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { useWindowSize } from '../utils';
-import Chart from './chart';
+import Calendar from './calendar';
 import History from './history';
 
 import './index.scss';
@@ -89,13 +90,19 @@ export default function Index() {
       {styleZoom && dailyTotal ? (
         <View>
           {/*FIXME: 默认值为1传入然后动态产生变化，会导致图表高宽错乱。目前先workaround等值动态取到后再实例化子组建。*/}
-          <Chart data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></Chart>
+          <Calendar data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></Calendar>
           <History data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></History>
         </View>
       ) : (
         <View className='loading'>{t('common.loading')}</View>
       )}
-      <View className='sign'>{t('common.sign')}</View>
+      <View className='footer'>
+        <View>{t('chart.subtitle')}</View>
+        <View className='copyright'>
+          <Image className='github' src={githubImg} />
+          <Text>{t('common.sign')}</Text>
+        </View>
+      </View>
     </View>
   );
 }

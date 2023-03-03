@@ -22,18 +22,13 @@ const getOption: EChartOption = (dailyTotal, styleZoom, styleRatio, t) => {
   });
   const option = {
     title: {
-      top: 10 * styleZoom * styleRatio,
+      top: 20 * styleZoom * styleRatio,
       itemGap: 10 * styleZoom,
       left: 'center',
       text: t('chart.name'),
       textStyle: {
         fontSize: 20 * styleZoom,
       },
-      subtext: t('chart.subtitle'),
-      subtextStyle: {
-        fontSize: 14 * styleZoom,
-      },
-      sublink: 'https://weibo.com/u/1742987497',
     },
     visualMap: {
       min: 0,
@@ -109,7 +104,7 @@ const getOption: EChartOption = (dailyTotal, styleZoom, styleRatio, t) => {
   return option;
 };
 
-export const Chart = (props: Props) => {
+export const Calendar = (props: Props) => {
   const { t } = useTranslation();
   const { data: dailyTotal, styleZoom, styleRatio } = props;
   const ref = useRef<EChartsInstance>(null);
@@ -147,4 +142,4 @@ export const Chart = (props: Props) => {
   );
 };
 
-export default Chart;
+export default Calendar;

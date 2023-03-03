@@ -6,7 +6,7 @@
     "data": "数据"
   },
   "chart": {
-    "name": "上海地铁客流统计",
+    "name": "月度统计",
     "subtitle": "数据来源于微博@上海地铁shmetro",
     "history": "历史数据",
     "unit": "万人次"
@@ -16,6 +16,6 @@
     "loading": "加载中...",
     "date_pattern": "yyyy年mm月dd日",
     "short_date_pattern": "mm月dd日",
-    "sign": "by helloint"
+    "sign": "helloint/taro-shmetro"
   }
 }

@@ -1,5 +1,7 @@
 @import './pages/styles/variables.scss';
-
+page {
+  background-color: #100c28;
+}
 .page {
   max-width: 750px;
   /*  #ifdef rn  */
@@ -14,14 +16,28 @@
 }
 
 .loading {
+  margin: 50px;
   font-size: 14px;
   text-align: center;
   color: #fff;
 }
 
-.sign {
+.footer {
+  padding: 5px 0;
   font-size: 12px;
   text-align: center;
   color: #b9b8cc;
-  padding: 5px 0;
+
+  .copyright {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    .github {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      margin: 5px;
+    }
+  }
 }
