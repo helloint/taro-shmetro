@@ -8,6 +8,7 @@ import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { useWindowSize } from '../utils';
 import Calendar from './calendar';
 import History from './history';
+import { LoadingTail } from './loading';
 
 import './index.scss';
 
@@ -94,7 +95,10 @@ export default function Index() {
           <History data={dailyTotal} styleZoom={styleZoom} styleRatio={styleRatio}></History>
         </View>
       ) : (
-        <View className='loading'>{t('common.loading')}</View>
+        <View className='loading'>
+          {t('common.loading')}
+          <LoadingTail />
+        </View>
       )}
       <View className='footer'>
         <View>{t('chart.subtitle')}</View>
